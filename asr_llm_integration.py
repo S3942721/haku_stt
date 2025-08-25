@@ -35,6 +35,9 @@ from llm_vad_eou_streaming_with_punctuation_quiet import OnlineASRWithPunctuatio
 import pyaudio as pa
 import numpy as np
 
+# Import the lambda client
+from lambda_llm_client import LambdaLLMClient, LambdaWebSocketClient
+
 class BedrockLLMClient:
     """Client for communicating with AWS Bedrock directly"""
     
@@ -160,48 +163,26 @@ class WebSocketLLMClient:
             
             print(f"Connecting to WebSocket: {uri}")
             
-            # WebSocket connection with headers for authentication
-            headers = {
-                'Origin': 'https://localhost:3000',  # Add origin header
-                'User-Agent': 'ASR-LLM-Integration/1.0'
-            }
-            
-            # Try to get AWS credentials for WebSocket authentication
-            try:
-                import boto3
-                from botocore.auth import SigV4Auth
-                from botocore.awsrequest import AWSRequest
-                from urllib.parse import urlparse
-                
-                # Parse the WebSocket URL
-                parsed = urlparse(uri)
-                
-                # Create a session to get credentials
-                session = boto3.Session()
-                credentials = session.get_credentials()
-                
-                if credentials:
-                    # Create a signed request for WebSocket upgrade
-                    # Note: This is a simplified approach - proper WebSocket signing is more complex
-                    print("Found AWS credentials, attempting authenticated connection...")
-                
-            except Exception as auth_error:
-                print(f"Could not set up AWS authentication: {auth_error}")
-            
             async with websockets.connect(
-                uri, 
-                extra_headers=headers,
-                timeout=10
+                uri
             ) as websocket:
-                # Send the completion request (matching JavaScript format)
+                # Send the completion request (exactly matching JavaScript format)
+                # request_data = {
+                #     "action": "completion",
+                #     "history": self.conversation_history.copy(),  # Send full conversation history
+                #     "deepSearch": deep_search,
+                #     "sessionId": self.session_id
+                # }
+                
                 request_data = {
                     "action": "completion",
-                    "history": self.conversation_history,
-                    "deepSearch": deep_search,
+                    "history": [{"role": "user", "content": message}],
                     "sessionId": self.session_id
                 }
                 
-                print(f"Sending request to WebSocket...")
+                print(f"Sending WebSocket request:")
+                print(json.dumps(request_data, indent=2))
+                
                 await websocket.send(json.dumps(request_data))
                 
                 complete_response = ""
@@ -212,20 +193,24 @@ class WebSocketLLMClient:
                 try:
                     while timeout_count < max_timeout:
                         try:
-                            message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                            message_data = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                             timeout_count = 0  # Reset timeout on successful receive
                             
-                            data = json.loads(message)
+                            data = json.loads(message_data)
                             print(f"Received WebSocket message: {data}")
                             
                             if data.get("action") == "completion":
                                 if "content" in data:
-                                    complete_response += data["content"]
-                                    print(f"Content chunk: {data['content']}")
+                                    content_chunk = data["content"]
+                                    complete_response += content_chunk
+                                    print(f"Content chunk: {content_chunk}")
                                 
                                 if data.get("isFinished", False):
                                     print("Response finished")
                                     break
+                            elif "error" in data:
+                                print(f"WebSocket error from server: {data['error']}")
+                                return f"Server error: {data['error']}"
                                     
                         except asyncio.TimeoutError:
                             timeout_count += 1
@@ -255,6 +240,8 @@ class WebSocketLLMClient:
                 error_msg += "\n3. Ensure your AWS credentials have proper permissions"
                 error_msg += "\n4. Check if the WebSocket route requires authentication"
                 error_msg += "\n5. Try using --use-bedrock instead for direct AWS access"
+                error_msg += f"\n\nRequest that failed:"
+                error_msg += f"\n{json.dumps({'action': 'completion', 'history': self.conversation_history}, indent=2)}"
             print(error_msg)
             return error_msg
         except Exception as e:
@@ -549,17 +536,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Using AWS Bedrock directly (recommended - avoids WebSocket auth issues)
+  # Using AWS Bedrock directly (recommended)
   python asr_llm_integration.py --use-bedrock --model-id anthropic.claude-3-sonnet-20240229-v1:0
 
-  # Using WebSocket endpoint (may require proper authentication setup)
+  # Using Lambda functionality directly (includes Knowledge Base)
+  python asr_llm_integration.py --use-lambda --model-id anthropic.claude-3-sonnet-20240229-v1:0
+
+  # Using WebSocket endpoint
   python asr_llm_integration.py --llm-endpoint wss://your-api-gateway.execute-api.region.amazonaws.com/prod
 
   # Testing mode (echo responses)
   python asr_llm_integration.py --test-mode
-
-  # With custom ASR model and no retries
-  python asr_llm_integration.py --use-bedrock --asr-model stt_en_fastconformer_hybrid_large_streaming_80ms --no-retry
         """
     )
     
@@ -573,6 +560,11 @@ Examples:
         "--use-bedrock",
         action="store_true",
         help="Use AWS Bedrock directly (requires AWS credentials)"
+    )
+    llm_group.add_argument(
+        "--use-lambda",
+        action="store_true",
+        help="Use Lambda functionality directly (includes Knowledge Base access)"
     )
     llm_group.add_argument(
         "--test-mode",
@@ -713,6 +705,16 @@ Examples:
                 region=args.aws_region
             )
             print("Using AWS Bedrock for LLM communication")
+        elif args.use_lambda:
+            if not AWS_AVAILABLE:
+                print("Error: boto3 not installed. Install with: pip install boto3")
+                return
+            llm_client = LambdaWebSocketClient(
+                region=args.aws_region,
+                model_id=args.model_id
+            )
+            print("Using Lambda functionality (includes Knowledge Base access)")
+            print("Note: Requires KB_ID environment variable for Knowledge Base access")
         elif args.test_mode:
             llm_client = SimpleLLMClient("http://test")
             print("Using test mode (echo responses)")
@@ -723,7 +725,8 @@ Examples:
                 region=args.aws_region
             )
             print(f"Using WebSocket endpoint: {args.llm_endpoint}")
-            print("Note: WebSocket may require proper authentication setup in API Gateway")
+            print("Note: WebSocket requests will be sent in the format:")
+            print('{"action": "completion", "history": [{"role": "user", "content": "message"}]}')
         
         # Initialize ASR-LLM integration
         integration = ASRLLMIntegration(
@@ -749,8 +752,26 @@ Examples:
         print(f"EOU Detection: {'Enabled' if not args.no_eou else 'Disabled'}")
         print(f"Retry on Error: {'Enabled' if not args.no_retry else 'Disabled'}")
         
+        if args.use_lambda:
+            print("\nLambda functionality includes:")
+            print("- Direct Bedrock access with streaming")
+            print("- Knowledge Base search integration")
+            print("- Tool calling support")
+            print("- RMIT University research assistant prompts")
+        
         if args.llm_endpoint:
             print("\n" + "="*60)
+            print("WEBSOCKET REQUEST FORMAT:")
+            print("="*60)
+            print("Each request will be sent as:")
+            print(json.dumps({
+                "action": "completion",
+                "history": [
+                    {"role": "user", "content": "your speech input"}
+                ]
+            }, indent=2))
+            print("="*60 + "\n")
+            
             print("WEBSOCKET TROUBLESHOOTING TIPS:")
             print("="*60)
             print("If you get 403 errors:")
