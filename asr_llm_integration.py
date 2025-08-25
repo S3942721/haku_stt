@@ -335,12 +335,11 @@ class FrameLevelSpeechDetector:
                     speech_probs = vad_probs[:, 1]  # Get speech probabilities
                     speech_detected_frames = (speech_probs > self.speech_probability_threshold).tolist()
                     
-                    if len(speech_detected_frames) > 0:
-                    # if not self.quiet_mode and len(speech_detected_frames) > 0:
+                    if len(speech_detected_frames) > 0 and not self.quiet_mode:
                         # Debug: show some frame stats occasionally
                         avg_speech_prob = np.mean(speech_probs)
                         speech_frame_count = sum(speech_detected_frames)
-                        if len(self.speech_frame_history) % 50 == 0 and self.verbose:  # Log every 50 updates
+                        if len(self.speech_frame_history) % 50 == 0:  # Log every 50 updates
                             print(f"[VAD-DEBUG] {len(speech_detected_frames)} frames, "
                                   f"avg_speech_prob: {avg_speech_prob:.3f}, "
                                   f"speech_frames: {speech_frame_count}")
@@ -894,17 +893,18 @@ class OnlineASRWithPunctuation:
             self.conversation_buffer.append(raw_text)
             
             # Only check text-based EOU periodically
-            if len(self.conversation_buffer) % 5 != 0:  # Check every 5th update
+            if len(self.conversation_buffer) % 3 != 0:  # Check every 3rd update for text-based
                 pass
             else:
                 # Analyze the full conversation context for EOU
                 full_conversation = " ".join(self.conversation_buffer)
                 
-                # Additional safeguards
+                # Additional safeguards for text-based EOU
                 if len(full_conversation.split()) >= 5:  # Need at least 5 words
                     is_text_eou = self.eou_detector.detect_eou(full_conversation)
         
-        # Combine both EOU detection methods
+        # Combined EOU detection: Either VAD-based OR text-based can trigger
+        # VAD-based is more immediate, text-based provides semantic confirmation
         is_eou = is_frame_eou or is_text_eou
         
         # Apply punctuation if enabled
@@ -925,6 +925,8 @@ class OnlineASRWithPunctuation:
             
             if not self.quiet_mode:
                 eou_type = "VAD" if is_frame_eou else "Text"
+                if is_frame_eou and is_text_eou:
+                    eou_type = "VAD+Text"
                 print(f"[{eou_type}-EOU] End of utterance confirmed, performing complete ASR reset")
             
             # COMPLETE ASR RESET - Reset conversation buffer and streaming state entirely
