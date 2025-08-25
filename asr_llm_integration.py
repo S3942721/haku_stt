@@ -73,10 +73,10 @@ class EndOfUtteranceDetector:
         """Initialize the TurnSense end-of-utterance detection model"""
         self.quiet_mode = quiet_mode
         self.model_id = "latishab/turnsense"
-        self.threshold = 0.8  # Increased threshold to reduce false positives
+        self.threshold = 0.75  # Reduced from 0.8 to be more sensitive
         
         # Add additional criteria to reduce false positives
-        self.min_words_for_eou = 8  # Require at least 8 words before considering EOU
+        self.min_words_for_eou = 5  # Reduced from 8 to 5 words
         self.confirmation_needed = 2  # Require 2 consecutive positive detections
         self.recent_detections = []  # Track recent EOU detections
         
@@ -182,15 +182,24 @@ class EndOfUtteranceDetector:
                 '.', '?', '!', '. thank you', '. thanks', 'that\'s it', 'that is it'
             ])
             
-            # Only trigger EOU if we have both model confidence AND natural ending indicators
-            final_eou = is_eou and (has_natural_ending or eou_probability > 0.9)
+            # Relaxed triggering logic - trigger EOU if:
+            # 1. High confidence (> 0.9) regardless of ending, OR
+            # 2. Medium confidence (> threshold) AND has natural ending, OR  
+            # 3. Medium confidence (> threshold) AND confirmations AND reasonable length
+            final_eou = (
+                eou_probability > 0.9 or  # Very high confidence
+                (is_eou and has_natural_ending) or  # Medium confidence + natural ending
+                (is_eou and word_count >= 8)  # Medium confidence + longer utterance
+            )
             
-            if not self.quiet_mode and final_eou:
-                print(f"[EOU] Detected end of utterance (confidence: {eou_probability:.3f}, words: {word_count}, confirmations: {confirmation_count})")
-            elif not self.quiet_mode and is_above_threshold:
-                print(f"[EOU] Potential EOU detected but not confirmed (confidence: {eou_probability:.3f}, words: {word_count})")
+            if not self.quiet_mode:
+                if final_eou:
+                    print(f"[EOU] Detected end of utterance (confidence: {eou_probability:.3f}, words: {word_count}, confirmations: {confirmation_count})")
+                elif is_above_threshold:
+                    print(f"[EOU] Potential EOU detected but not confirmed (confidence: {eou_probability:.3f}, words: {word_count})")
             
-            print(f"Current EOU probability: {eou_probability}, recent detections: {self.recent_detections}")
+            if not self.quiet_mode:
+                print(f"Current EOU probability: {eou_probability}, recent detections: {self.recent_detections}")
             
             # Reset detection history if we actually trigger EOU
             if final_eou:
@@ -331,7 +340,7 @@ class FrameLevelSpeechDetector:
                         # Debug: show some frame stats occasionally
                         avg_speech_prob = np.mean(speech_probs)
                         speech_frame_count = sum(speech_detected_frames)
-                        if len(self.speech_frame_history) % 50 == 0:  # Log every 50 updates
+                        if len(self.speech_frame_history) % 50 == 0 and self.verbose:  # Log every 50 updates
                             print(f"[VAD-DEBUG] {len(speech_detected_frames)} frames, "
                                   f"avg_speech_prob: {avg_speech_prob:.3f}, "
                                   f"speech_frames: {speech_frame_count}")
@@ -1059,7 +1068,7 @@ class WebSocketLLMClient:
         self.session_id = None
         self.conversation_history = []
         
-    async def send_message_websocket(self, message: str, deep_search: bool = False) -> str:
+    async def send_message_websocket(self, message: str, deep_search: bool = False, quiet_mode: bool = False) -> str:
         """Send message via WebSocket and return the complete response"""
         if not self.session_id:
             self.session_id = f"asr_session_{int(time.time())}"
@@ -1078,66 +1087,97 @@ class WebSocketLLMClient:
             elif uri.startswith('http://'):
                 uri = uri.replace('http://', 'ws://')
             
-            print(f"Connecting to WebSocket: {uri}")
+            if not quiet_mode:
+                print(f"Connecting to WebSocket: {uri}")
             
             async with websockets.connect(
                 uri
             ) as websocket:
-                # Send the completion request (exactly matching JavaScript format)
-                # request_data = {
-                #     "action": "completion",
-                #     "history": self.conversation_history.copy(),  # Send full conversation history
-                #     "deepSearch": deep_search,
-                #     "sessionId": self.session_id
-                # }
-                
                 request_data = {
                     "action": "completion",
                     "history": [{"role": "user", "content": message}],
                     "sessionId": self.session_id
                 }
                 
-                print(f"Sending WebSocket request:")
-                print(json.dumps(request_data, indent=2))
+                if not quiet_mode:
+                    print(f"Sending WebSocket request:")
+                    print(json.dumps(request_data, indent=2))
                 
                 await websocket.send(json.dumps(request_data))
                 
-                complete_response = ""
+                # Store chunks by chunk number for proper ordering
+                chunks = {}
+                max_chunk_number = 0
+                is_finished = False
                 timeout_count = 0
                 max_timeout = 30  # 30 second timeout
                 
+                # Initialize progressive display for quiet mode
+                if quiet_mode:
+                    print(f"[LLM] ", end='', flush=True)
+                
                 # Receive response chunks with timeout
                 try:
-                    while timeout_count < max_timeout:
+                    while timeout_count < max_timeout and not is_finished:
                         try:
                             message_data = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                             timeout_count = 0  # Reset timeout on successful receive
                             
                             data = json.loads(message_data)
-                            print(f"Received WebSocket message: {data}")
+                            if not quiet_mode:
+                                print(f"Received WebSocket message: {data}")
                             
                             if data.get("action") == "completion":
-                                if "content" in data:
+                                if "content" in data and "chunkNumber" in data:
+                                    chunk_number = data["chunkNumber"]
                                     content_chunk = data["content"]
-                                    complete_response += content_chunk
-                                    print(f"Content chunk: {content_chunk}")
+                                    chunks[chunk_number] = content_chunk
+                                    max_chunk_number = max(max_chunk_number, chunk_number)
+                                    
+                                    # Build response progressively in order
+                                    ordered_response = ""
+                                    for i in range(1, max_chunk_number + 1):
+                                        if i in chunks:
+                                            ordered_response += chunks[i]
+                                    
+                                    # Update display in quiet mode - rewrite the entire line
+                                    if quiet_mode:
+                                        # Clear the line and rewrite with updated content
+                                        print(f"\r[LLM] {ordered_response}", end='', flush=True)
+                                    elif not quiet_mode:
+                                        print(f"Content chunk {chunk_number}: {content_chunk}")
                                 
                                 if data.get("isFinished", False):
-                                    print("Response finished")
-                                    break
+                                    is_finished = True
+                                    final_chunk_number = data.get("chunkNumber", max_chunk_number)
+                                    if not quiet_mode:
+                                        print(f"Response finished at chunk {final_chunk_number}")
+                                    
                             elif "error" in data:
-                                print(f"WebSocket error from server: {data['error']}")
-                                return f"Server error: {data['error']}"
+                                error_msg = f"Server error: {data['error']}"
+                                if quiet_mode:
+                                    print(f"\r[LLM] {error_msg}", end='', flush=True)
+                                else:
+                                    print(f"WebSocket error from server: {data['error']}")
+                                return error_msg
                                     
                         except asyncio.TimeoutError:
                             timeout_count += 1
                             continue
                         except json.JSONDecodeError as e:
-                            print(f"JSON decode error: {e}")
+                            if not quiet_mode:
+                                print(f"JSON decode error: {e}")
                             continue
                             
                 except Exception as recv_error:
-                    print(f"Error receiving WebSocket message: {recv_error}")
+                    if not quiet_mode:
+                        print(f"Error receiving WebSocket message: {recv_error}")
+                
+                # Build final ordered response
+                complete_response = ""
+                for i in range(1, max_chunk_number + 1):
+                    if i in chunks:
+                        complete_response += chunks[i]
                 
                 # Add assistant response to conversation history
                 if complete_response.strip():
@@ -1157,21 +1197,21 @@ class WebSocketLLMClient:
                 error_msg += "\n3. Ensure your AWS credentials have proper permissions"
                 error_msg += "\n4. Check if the WebSocket route requires authentication"
                 error_msg += "\n5. Try using --use-bedrock instead for direct AWS access"
-                error_msg += f"\n\nRequest that failed:"
-                error_msg += f"\n{json.dumps({'action': 'completion', 'history': self.conversation_history}, indent=2)}"
-            print(error_msg)
+            if not quiet_mode:
+                print(error_msg)
             return error_msg
         except Exception as e:
             error_msg = f"WebSocket error: {e}"
-            print(error_msg)
+            if not quiet_mode:
+                print(error_msg)
             return error_msg
     
-    def send_message_sync(self, message: str, deep_search: bool = False) -> str:
+    def send_message_sync(self, message: str, deep_search: bool = False, quiet_mode: bool = False) -> str:
         """Synchronous wrapper for sending messages"""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            return loop.run_until_complete(self.send_message_websocket(message, deep_search))
+            return loop.run_until_complete(self.send_message_websocket(message, deep_search, quiet_mode))
         finally:
             loop.close()
     
@@ -1222,7 +1262,8 @@ class ASRLLMIntegration:
         self.running = False
         
         # Initialize ASR system using the complete OnlineASRWithPunctuation class
-        print("Initializing ASR system...")
+        if not quiet_mode:
+            print("Initializing ASR system...")
         self.asr_system = OnlineASRWithPunctuation(
             asr_model_name=asr_model_name,
             punct_model_name=punct_model_name,
@@ -1232,7 +1273,8 @@ class ASRLLMIntegration:
             enable_eou=enable_eou
         )
         
-        print("ASR-LLM Integration ready!")
+        if not quiet_mode:
+            print("ASR-LLM Integration ready!")
     
     def _llm_worker(self):
         """Worker thread that processes utterances and sends them to LLM"""
@@ -1244,10 +1286,14 @@ class ASRLLMIntegration:
                 if utterance is None:  # Shutdown signal
                     break
                 
-                print(f"\n{'='*60}")
-                print(f"[USER] {utterance}")
-                print(f"{'='*60}")
-                print("[LLM] Processing...")
+                if self.quiet_mode:
+                    # In quiet mode, just show the transition on a new line
+                    print(f"")  # Move to new line after user input
+                else:
+                    print(f"\n{'='*60}")
+                    print(f"[USER] {utterance}")
+                    print(f"{'='*60}")
+                    print("[LLM] Processing...")
                 
                 # Send to LLM with retry logic
                 response = None
@@ -1256,44 +1302,72 @@ class ASRLLMIntegration:
                 
                 while retry_count <= max_retries and response is None:
                     try:
-                        response = self.llm_client.send_message_sync(utterance, deep_search=False)
+                        # Pass quiet_mode to the LLM client if it supports it
+                        if hasattr(self.llm_client, 'send_message_sync') and 'quiet_mode' in self.llm_client.send_message_sync.__code__.co_varnames:
+                            response = self.llm_client.send_message_sync(utterance, deep_search=False, quiet_mode=self.quiet_mode)
+                        else:
+                            response = self.llm_client.send_message_sync(utterance, deep_search=False)
                         
                         # Check if we got an error response
                         if "WebSocket connection failed" in response or "server rejected" in response:
                             if retry_count < max_retries:
-                                print(f"[LLM] WebSocket error, retrying... (attempt {retry_count + 1}/{max_retries + 1})")
+                                error_msg = f"WebSocket error, retrying... (attempt {retry_count + 1}/{max_retries + 1})"
+                                if self.quiet_mode:
+                                    print(f"\r[LLM] {error_msg}", end='', flush=True)
+                                else:
+                                    print(f"[LLM] {error_msg}")
                                 time.sleep(2)  # Wait before retry
                                 response = None
                                 retry_count += 1
                                 continue
                             else:
-                                print(f"[LLM] WebSocket failed after {max_retries + 1} attempts")
-                                response = "Sorry, I'm having trouble connecting to the LLM service. Please check the WebSocket endpoint configuration."
+                                error_msg = "Sorry, I'm having trouble connecting to the LLM service. Please check the WebSocket endpoint configuration."
+                                if self.quiet_mode:
+                                    print(f"\r[LLM] {error_msg}", end='', flush=True)
+                                else:
+                                    print(f"[LLM] WebSocket failed after {max_retries + 1} attempts")
+                                response = error_msg
                         
                     except Exception as e:
                         if retry_count < max_retries:
-                            print(f"[LLM] Error occurred, retrying... (attempt {retry_count + 1}/{max_retries + 1}): {e}")
+                            error_msg = f"Error occurred, retrying... (attempt {retry_count + 1}/{max_retries + 1}): {e}"
+                            if self.quiet_mode:
+                                print(f"\r[LLM] {error_msg}", end='', flush=True)
+                            else:
+                                print(f"[LLM] {error_msg}")
                             time.sleep(2)
                             retry_count += 1
                             continue
                         else:
-                            print(f"[LLM] Failed after {max_retries + 1} attempts: {e}")
-                            response = f"Sorry, I encountered an error: {e}"
+                            error_msg = f"Sorry, I encountered an error: {e}"
+                            if self.quiet_mode:
+                                print(f"\r[LLM] {error_msg}", end='', flush=True)
+                            else:
+                                print(f"[LLM] Failed after {max_retries + 1} attempts: {e}")
+                            response = error_msg
                             break
                 
                 # Clean up response (remove thinking tags, etc.)
                 cleaned_response = self._clean_llm_response(response)
                 
-                print(f"\n[LLM] {cleaned_response}")
-                print(f"{'='*60}")
-                print("Listening for next utterance...")
+                if self.quiet_mode:
+                    # In quiet mode, ensure we show the final response if not already shown progressively
+                    if not hasattr(self.llm_client, 'send_message_sync') or 'quiet_mode' not in self.llm_client.send_message_sync.__code__.co_varnames:
+                        print(f"\r[LLM] {cleaned_response}", end='', flush=True)
+                    # Move to new line and prepare for next user input
+                    print(f"\n[USER] ", end='', flush=True)
+                else:
+                    print(f"\n[LLM] {cleaned_response}")
+                    print(f"{'='*60}")
+                    print("Listening for next utterance...")
                 
                 self.utterance_queue.task_done()
                 
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"LLM worker error: {e}")
+                if not self.quiet_mode:
+                    print(f"LLM worker error: {e}")
                 continue
     
     def _clean_llm_response(self, response: str) -> str:
@@ -1343,7 +1417,8 @@ class ASRLLMIntegration:
         if chunk_size_ms is None:
             chunk_size_ms = self.asr_system.lookahead_size + ENCODER_STEP_LENGTH
         
-        print(f"Using chunk size: {chunk_size_ms}ms")
+        if not self.quiet_mode:
+            print(f"Using chunk size: {chunk_size_ms}ms")
         
         # Initialize PyAudio
         p = pa.PyAudio()
@@ -1357,28 +1432,35 @@ class ASRLLMIntegration:
                     input_devices.append(i)
             
             if not input_devices:
-                print('ERROR: No audio input device found.')
+                if not self.quiet_mode:
+                    print('ERROR: No audio input device found.')
                 return
             
             if device_id is None:
-                print('Available audio input devices:')
-                for i in input_devices:
-                    dev = p.get_device_info_by_index(i)
-                    print(f"  {i}: {dev.get('name')} (channels: {dev.get('maxInputChannels')})")
-                
-                device_id = -1
-                while device_id not in input_devices:
-                    try:
-                        device_id = int(input('Please enter input device ID: '))
-                    except ValueError:
-                        print("Please enter a valid device ID number")
-                        continue
+                if not self.quiet_mode:
+                    print('Available audio input devices:')
+                    for i in input_devices:
+                        dev = p.get_device_info_by_index(i)
+                        print(f"  {i}: {dev.get('name')} (channels: {dev.get('maxInputChannels')})")
+                    
+                    device_id = -1
+                    while device_id not in input_devices:
+                        try:
+                            device_id = int(input('Please enter input device ID: '))
+                        except ValueError:
+                            print("Please enter a valid device ID number")
+                            continue
+                else:
+                    # In quiet mode, use the first available device
+                    device_id = input_devices[0]
             
             if device_id not in input_devices:
-                print(f"Error: Device {device_id} not found in available input devices")
+                if not self.quiet_mode:
+                    print(f"Error: Device {device_id} not found in available input devices")
                 return
             
-            print(f"Using device {device_id}: {p.get_device_info_by_index(device_id)['name']}")
+            if not self.quiet_mode:
+                print(f"Using device {device_id}: {p.get_device_info_by_index(device_id)['name']}")
             
             # Calculate frames per buffer
             frames_per_buffer = int(SAMPLE_RATE * chunk_size_ms / 1000) - 1
@@ -1388,11 +1470,15 @@ class ASRLLMIntegration:
             last_raw = ""
             last_punct = ""
             
+            # Initialize quiet mode display
+            if self.quiet_mode:
+                print("[USER] ", end='', flush=True)
+            
             # Define callback function - exact same functionality as VAD EOU file
             def stream_callback(in_data, frame_count, time_info, status):
                 nonlocal last_utterance, last_raw, last_punct
                 
-                if status:
+                if status and not self.quiet_mode:
                     print(f"Stream status: {status}")
                 
                 # Convert audio data and transcribe using the exact same method
@@ -1401,11 +1487,15 @@ class ASRLLMIntegration:
                 
                 # Handle complete utterance - send to LLM
                 if is_eou and complete_utterance and complete_utterance != last_utterance:
-                    print(f"\n{'='*60}")
-                    print(f"COMPLETE UTTERANCE DETECTED:")
-                    print(f"{'='*60}")
-                    print(f"{complete_utterance}")
-                    print(f"{'='*60}")
+                    if self.quiet_mode:
+                        # In quiet mode, show the final user utterance with complete line rewrite
+                        print(f"\r[USER] {complete_utterance}", end='', flush=True)
+                    else:
+                        print(f"\n{'='*60}")
+                        print(f"COMPLETE UTTERANCE DETECTED:")
+                        print(f"{'='*60}")
+                        print(f"{complete_utterance}")
+                        print(f"{'='*60}")
                     
                     # Send to LLM
                     self.process_utterance(complete_utterance)
@@ -1419,9 +1509,10 @@ class ASRLLMIntegration:
                 # Show incremental updates if text has changed and it's not an EOU
                 if raw_text.strip() and raw_text != last_raw and not is_eou:
                     if self.quiet_mode:
-                        # In quiet mode, show incremental updates but suppress frequent updates
-                        if punct_text.strip() and len(punct_text.split()) > len(last_punct.split() if last_punct else []):
-                            print(f"\r{punct_text}", end='', flush=True)
+                        # In quiet mode, progressively update the user text on the same line
+                        if punct_text.strip():
+                            # Clear line and rewrite with updated punctuated text
+                            print(f"\r[USER] {punct_text}", end='', flush=True)
                     else:
                         print(f"\r[Listening] {punct_text}", end='', flush=True)
                     
@@ -1441,17 +1532,18 @@ class ASRLLMIntegration:
                 frames_per_buffer=frames_per_buffer
             )
             
-            print('\nListening for speech... (Press Ctrl+C to stop)')
-            print('When you finish speaking, the utterance will be sent to the LLM.')
-            if self.asr_system.punct_model:
-                print('Punctuation and capitalization enabled')
-            else:
-                print('No punctuation model loaded')
-            if self.asr_system.eou_detector:
-                print('End-of-utterance detection enabled')
-            else:
-                print('EOU detection disabled')
-            print('=' * 60)
+            if not self.quiet_mode:
+                print('\nListening for speech... (Press Ctrl+C to stop)')
+                print('When you finish speaking, the utterance will be sent to the LLM.')
+                if self.asr_system.punct_model:
+                    print('Punctuation and capitalization enabled')
+                else:
+                    print('No punctuation model loaded')
+                if self.asr_system.eou_detector:
+                    print('End-of-utterance detection enabled')
+                else:
+                    print('EOU detection disabled')
+                print('=' * 60)
             
             # Start streaming
             stream.start_stream()
@@ -1460,11 +1552,15 @@ class ASRLLMIntegration:
                 while stream.is_active():
                     time.sleep(0.1)
             except KeyboardInterrupt:
-                print('\n\nStopping...')
+                if self.quiet_mode:
+                    print("\nExiting...")
+                else:
+                    print('\n\nStopping...')
             finally:
                 stream.stop_stream()
                 stream.close()
-                print("Audio stream stopped")
+                if not self.quiet_mode:
+                    print("Audio stream stopped")
         
         finally:
             p.terminate()
@@ -1614,12 +1710,23 @@ Examples:
     )
     
     parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Quiet mode: only show progressive [USER] and [LLM] text updates"
+    )
+    
+    parser.add_argument(
         "--list-devices",
         action="store_true",
         help="List available audio devices and exit"
     )
     
     args = parser.parse_args()
+    
+    # Handle conflicting arguments
+    if args.verbose and args.quiet:
+        print("Error: --verbose and --quiet cannot be used together")
+        return
     
     # List devices and exit if requested
     if args.list_devices:
@@ -1634,7 +1741,8 @@ Examples:
     
     try:
         # Initialize LLM client based on selected mode
-        print("Initializing LLM client...")
+        if not args.quiet:
+            print("Initializing LLM client...")
         
         if args.use_bedrock:
             if not AWS_AVAILABLE:
@@ -1644,7 +1752,8 @@ Examples:
                 model_id=args.model_id,
                 region=args.aws_region
             )
-            print("Using AWS Bedrock for LLM communication")
+            if not args.quiet:
+                print("Using AWS Bedrock for LLM communication")
         elif args.use_lambda:
             if not AWS_AVAILABLE:
                 print("Error: boto3 not installed. Install with: pip install boto3")
@@ -1653,29 +1762,35 @@ Examples:
                 region=args.aws_region,
                 model_id=args.model_id
             )
-            print("Using Lambda functionality (includes Knowledge Base access)")
-            print("Note: Requires KB_ID environment variable for Knowledge Base access")
+            if not args.quiet:
+                print("Using Lambda functionality (includes Knowledge Base access)")
+                print("Note: Requires KB_ID environment variable for Knowledge Base access")
         elif args.test_mode:
             llm_client = SimpleLLMClient("http://test")
-            print("Using test mode (echo responses)")
+            if not args.quiet:
+                print("Using test mode (echo responses)")
         else:
             llm_client = WebSocketLLMClient(
                 api_endpoint=args.llm_endpoint,
                 model_id=args.model_id,
                 region=args.aws_region
             )
-            print(f"Using WebSocket endpoint: {args.llm_endpoint}")
-            print("Note: WebSocket requests will be sent in the format:")
-            print('{"action": "completion", "history": [{"role": "user", "content": "message"}]}')
+            if not args.quiet:
+                print(f"Using WebSocket endpoint: {args.llm_endpoint}")
+                print("Note: WebSocket requests will be sent in the format:")
+                print('{"action": "completion", "history": [{"role": "user", "content": "message"}]}')
         
         # Initialize ASR-LLM integration
+        # Set quiet_mode based on args: quiet mode if --quiet is set, verbose if --verbose is set
+        quiet_mode = args.quiet or not args.verbose
+        
         integration = ASRLLMIntegration(
             asr_model_name=args.asr_model,
             llm_client=llm_client,
             punct_model_name=args.punct_model,
             lookahead_size=args.lookahead,
             decoder_type=args.decoder,
-            quiet_mode=not args.verbose,
+            quiet_mode=quiet_mode,
             enable_eou=not args.no_eou,
             retry_on_error=not args.no_retry
         )
@@ -1686,40 +1801,41 @@ Examples:
             integration.asr_system.frame_detector.speech_proportion_threshold = args.vad_speech_proportion_threshold
             integration.asr_system.frame_detector.analysis_window_seconds = args.vad_analysis_window
         
-        print("\nASR-LLM Integration ready!")
-        print(f"ASR Model: {args.asr_model}")
-        print(f"Punctuation Model: {args.punct_model or 'None'}")
-        print(f"EOU Detection: {'Enabled' if not args.no_eou else 'Disabled'}")
-        print(f"Retry on Error: {'Enabled' if not args.no_retry else 'Disabled'}")
-        
-        if args.use_lambda:
-            print("\nLambda functionality includes:")
-            print("- Direct Bedrock access with streaming")
-            print("- Knowledge Base search integration")
-            print("- Tool calling support")
-            print("- RMIT University research assistant prompts")
-        
-        if args.llm_endpoint:
-            print("\n" + "="*60)
-            print("WEBSOCKET REQUEST FORMAT:")
-            print("="*60)
-            print("Each request will be sent as:")
-            print(json.dumps({
-                "action": "completion",
-                "history": [
-                    {"role": "user", "content": "your speech input"}
-                ]
-            }, indent=2))
-            print("="*60 + "\n")
+        if not args.quiet:
+            print("\nASR-LLM Integration ready!")
+            print(f"ASR Model: {args.asr_model}")
+            print(f"Punctuation Model: {args.punct_model or 'None'}")
+            print(f"EOU Detection: {'Enabled' if not args.no_eou else 'Disabled'}")
+            print(f"Retry on Error: {'Enabled' if not args.no_retry else 'Disabled'}")
             
-            print("WEBSOCKET TROUBLESHOOTING TIPS:")
-            print("="*60)
-            print("If you get 403 errors:")
-            print("1. Check API Gateway WebSocket route configuration")
-            print("2. Verify CORS settings allow WebSocket connections")
-            print("3. Ensure proper authentication is set up")
-            print("4. Try using --use-bedrock instead for direct access")
-            print("="*60 + "\n")
+            if args.use_lambda:
+                print("\nLambda functionality includes:")
+                print("- Direct Bedrock access with streaming")
+                print("- Knowledge Base search integration")
+                print("- Tool calling support")
+                print("- RMIT University research assistant prompts")
+            
+            if args.llm_endpoint:
+                print("\n" + "="*60)
+                print("WEBSOCKET REQUEST FORMAT:")
+                print("="*60)
+                print("Each request will be sent as:")
+                print(json.dumps({
+                    "action": "completion",
+                    "history": [
+                        {"role": "user", "content": "your speech input"}
+                    ]
+                }, indent=2))
+                print("="*60 + "\n")
+                
+                print("WEBSOCKET TROUBLESHOOTING TIPS:")
+                print("="*60)
+                print("If you get 403 errors:")
+                print("1. Check API Gateway WebSocket route configuration")
+                print("2. Verify CORS settings allow WebSocket connections")
+                print("3. Ensure proper authentication is set up")
+                print("4. Try using --use-bedrock instead for direct access")
+                print("="*60 + "\n")
         
         # Run the integration
         integration.run_streaming_asr(
