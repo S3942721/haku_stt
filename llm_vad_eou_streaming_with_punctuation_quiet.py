@@ -19,6 +19,14 @@ import os
 import sys
 from collections import deque
 
+# Add remote audio stream import
+try:
+    from remote_audio_stream import RemoteAudioStream
+    REMOTE_AUDIO_AVAILABLE = True
+except ImportError:
+    print("WARNING: Remote audio stream not available - falling back to microphone only")
+    REMOTE_AUDIO_AVAILABLE = False
+
 # Add EOU detection imports
 import onnxruntime as ort
 from transformers import AutoTokenizer
@@ -197,10 +205,10 @@ class FrameLevelSpeechDetector:
         # Rolling window to store frame-level speech detection results
         self.speech_frame_history = deque(maxlen=self.frames_per_analysis_window)
         
-        # EOU detection parameters - made more sensitive
-        self.speech_proportion_threshold = 0.2  # If less than 20% of frames have speech, consider it silence (increased from 10%)
-        self.min_frames_for_eou = int(0.5 / self.vad_frame_duration)  # Need at least 0.5 second of data (reduced from 1s)
-        self.speech_probability_threshold = 0.5  # VAD threshold for individual frame speech detection
+        # EOU detection parameters - adjusted for better sensitivity
+        self.speech_proportion_threshold = 0.15  # If less than 15% of frames have speech, consider it silence
+        self.min_frames_for_eou = int(0.5 / self.vad_frame_duration)  # Need at least 0.5 second of data
+        self.speech_probability_threshold = 0.25  # Lowered threshold further for better detection
         
         # Consecutive silence detection for more responsive EOU
         self.consecutive_silence_frames = 0
@@ -243,7 +251,7 @@ class FrameLevelSpeechDetector:
                 print(f"Warning: Could not load VAD model: {e}")
                 print("Falling back to basic frame analysis...")
             self.vad_model = None
-        
+    
     def analyze_audio_vad(self, audio_signal):
         """
         Analyze audio using NeMo VAD model to detect speech activity per frame
@@ -305,6 +313,15 @@ class FrameLevelSpeechDetector:
                 if vad_probs.shape[1] == 2:
                     # Extract speech probabilities (second column)
                     speech_probs = vad_probs[:, 1]  # Get speech probabilities
+                    
+                    # Apply softmax to convert logits to probabilities if needed
+                    if np.any(speech_probs < 0) or np.any(speech_probs > 1):
+                        # These look like logits, apply softmax
+                        exp_probs = np.exp(vad_probs - np.max(vad_probs, axis=1, keepdims=True))
+                        softmax_probs = exp_probs / np.sum(exp_probs, axis=1, keepdims=True)
+                        speech_probs = softmax_probs[:, 1]  # Speech probabilities after softmax
+                    
+                    # Now apply threshold to get binary decisions
                     speech_detected_frames = (speech_probs > self.speech_probability_threshold).tolist()
                     
                     if len(speech_detected_frames) > 0:
@@ -315,7 +332,8 @@ class FrameLevelSpeechDetector:
                         if len(self.speech_frame_history) % 50 == 0:  # Log every 50 updates
                             print(f"[VAD-DEBUG] {len(speech_detected_frames)} frames, "
                                   f"avg_speech_prob: {avg_speech_prob:.3f}, "
-                                  f"speech_frames: {speech_frame_count}")
+                                  f"speech_frames: {speech_frame_count}, "
+                                  f"threshold: {self.speech_probability_threshold}")
                     return speech_detected_frames
                 else:
                     if not self.quiet_mode:
@@ -323,7 +341,13 @@ class FrameLevelSpeechDetector:
                     return []
             elif vad_probs.ndim == 1:
                 # Single dimension - treat as speech probabilities directly
-                speech_detected_frames = (vad_probs > self.speech_probability_threshold).tolist()
+                # Apply sigmoid if values look like logits
+                if np.any(vad_probs < 0) or np.any(vad_probs > 1):
+                    speech_probs = 1.0 / (1.0 + np.exp(-vad_probs))  # Sigmoid
+                else:
+                    speech_probs = vad_probs
+                
+                speech_detected_frames = (speech_probs > self.speech_probability_threshold).tolist()
                 return speech_detected_frames
             else:
                 if not self.quiet_mode:
@@ -454,8 +478,8 @@ class FrameLevelSpeechDetector:
         if not lookback_analysis["sufficient_data"]:
             return False
         
-        # Consider it "recent speech activity" if more than 15% of frames had speech (reduced from 20%)
-        return lookback_analysis["speech_proportion"] > 0.15
+        # Consider it "recent speech activity" if more than 10% of frames had speech (lowered threshold)
+        return lookback_analysis["speech_proportion"] > 0.10
     
     def reset_silence_tracking(self):
         """Reset consecutive silence tracking"""
@@ -817,102 +841,143 @@ class OnlineASRWithPunctuation:
         Returns:
             tuple: (raw_text, punctuated_text, is_eou, complete_utterance)
         """
-        # Convert int16 to float32 and normalize
-        audio_data = audio_chunk.astype(np.float32) / 32768.0
-        
-        # VAD-based EOU detection using raw audio (before preprocessing)
-        is_frame_eou = self._check_end_of_utterance_frame_based(audio_data)
-        
-        # Get mel-spectrogram
-        processed_signal, processed_signal_length = self._preprocess_audio(audio_data)
-        
-        # Prepend with pre-encode cache
-        processed_signal = torch.cat([self.cache_pre_encode, processed_signal], dim=-1)
-        processed_signal_length += self.cache_pre_encode.shape[1]
-        
-        # Update cache for next iteration
-        self.cache_pre_encode = processed_signal[:, :, -self.pre_encode_cache_size:]
-        
-        # Run streaming inference
-        with torch.no_grad():
-            (
-                self.pred_out_stream,
-                transcribed_texts,
-                self.cache_last_channel,
-                self.cache_last_time,
-                self.cache_last_channel_len,
-                self.previous_hypotheses,
-            ) = self.asr_model.conformer_stream_step(
-                processed_signal=processed_signal,
-                processed_signal_length=processed_signal_length,
-                cache_last_channel=self.cache_last_channel,
-                cache_last_time=self.cache_last_time,
-                cache_last_channel_len=self.cache_last_channel_len,
-                keep_all_outputs=False,
-                previous_hypotheses=self.previous_hypotheses,
-                previous_pred_out=self.pred_out_stream,
-                drop_extra_pre_encoded=None,
-                return_transcription=True,
-            )
-        
-        # Extract transcription
-        final_transcriptions = self._extract_transcriptions(transcribed_texts)
-        raw_text = final_transcriptions[0] if final_transcriptions else ""
-        
-        # Text-based EOU detection (existing logic)
-        is_text_eou = False
-        if self.eou_detector and raw_text.strip():
-            # Add current text to conversation buffer
-            self.conversation_buffer.append(raw_text)
+        try:
+            # Debug audio chunk input
+            if not self.quiet_mode and self.step_num % 50 == 0:
+                print(f"ASR DEBUG: Processing chunk #{self.step_num} - size: {len(audio_chunk)}, "
+                      f"dtype: {audio_chunk.dtype}, range: [{np.min(audio_chunk)}, {np.max(audio_chunk)}]")
             
-            # Only check text-based EOU periodically
-            if len(self.conversation_buffer) % 5 != 0:  # Check every 5th update
-                pass
-            else:
-                # Analyze the full conversation context for EOU
-                full_conversation = " ".join(self.conversation_buffer)
+            # Convert int16 to float32 and normalize
+            audio_data = audio_chunk.astype(np.float32) / 32768.0
+            
+            # VAD-based EOU detection using raw audio (before preprocessing)
+            is_frame_eou = self._check_end_of_utterance_frame_based(audio_data)
+            
+            # Get mel-spectrogram
+            processed_signal, processed_signal_length = self._preprocess_audio(audio_data)
+            
+            # Debug preprocessing output
+            if not self.quiet_mode and self.step_num % 50 == 0:
+                print(f"ASR DEBUG: Preprocessed signal shape: {processed_signal.shape}, "
+                      f"length: {processed_signal_length}")
+            
+            # Prepend with pre-encode cache
+            processed_signal = torch.cat([self.cache_pre_encode, processed_signal], dim=-1)
+            processed_signal_length += self.cache_pre_encode.shape[1]
+            
+            # Update cache for next iteration
+            self.cache_pre_encode = processed_signal[:, :, -self.pre_encode_cache_size:]
+            
+            # Debug tensor shapes before ASR
+            if not self.quiet_mode and self.step_num % 50 == 0:
+                print(f"ASR DEBUG: Final signal shape: {processed_signal.shape}, "
+                      f"length: {processed_signal_length}, "
+                      f"cache_last_channel: {self.cache_last_channel.shape if self.cache_last_channel is not None else None}, "
+                      f"cache_last_time: {self.cache_last_time.shape if self.cache_last_time is not None else None}")
+            
+            # Run streaming inference
+            with torch.no_grad():
+                try:
+                    (
+                        self.pred_out_stream,
+                        transcribed_texts,
+                        self.cache_last_channel,
+                        self.cache_last_time,
+                        self.cache_last_channel_len,
+                        self.previous_hypotheses,
+                    ) = self.asr_model.conformer_stream_step(
+                        processed_signal=processed_signal,
+                        processed_signal_length=processed_signal_length,
+                        cache_last_channel=self.cache_last_channel,
+                        cache_last_time=self.cache_last_time,
+                        cache_last_channel_len=self.cache_last_channel_len,
+                        keep_all_outputs=False,
+                        previous_hypotheses=self.previous_hypotheses,
+                        previous_pred_out=self.pred_out_stream,
+                        drop_extra_pre_encoded=None,
+                        return_transcription=True,
+                    )
+                    
+                    # Debug ASR model output
+                    if not self.quiet_mode and self.step_num % 50 == 0:
+                        print(f"ASR DEBUG: Model output - transcribed_texts: {transcribed_texts}, "
+                              f"type: {type(transcribed_texts)}")
+                        
+                except Exception as asr_error:
+                    print(f"ASR ERROR in conformer_stream_step: {asr_error}")
+                    if not self.quiet_mode:
+                        import traceback
+                        traceback.print_exc()
+                    # Return empty results on ASR error
+                    return "", "", False, None
+            
+            # Extract transcription
+            final_transcriptions = self._extract_transcriptions(transcribed_texts)
+            raw_text = final_transcriptions[0] if final_transcriptions else ""
+            
+            # Debug transcription extraction
+            if not self.quiet_mode and (raw_text.strip() or self.step_num % 100 == 0):
+                print(f"ASR DEBUG: Extracted transcription: '{raw_text}' from {final_transcriptions}")
+            
+            # Text-based EOU detection (existing logic)
+            is_text_eou = False
+            if self.eou_detector and raw_text.strip():
+                # Add current text to conversation buffer
+                self.conversation_buffer.append(raw_text)
                 
-                # Additional safeguards
-                if len(full_conversation.split()) >= 5:  # Need at least 5 words
+                # Only check text-based EOU periodically
+                if len(self.conversation_buffer) % 5 != 0:  # Check every 5th update
+                    pass
+                else:
+                    # Analyze the full conversation context for EOU
+                    full_conversation = " ".join(self.conversation_buffer)
+
                     is_text_eou = self.eou_detector.detect_eou(full_conversation)
-        
-        # Combine both EOU detection methods
-        is_eou = is_frame_eou or is_text_eou
-        
-        # Apply punctuation if enabled
-        if self.punct_model and raw_text.strip():
-            punctuated_text = self._apply_punctuation(raw_text)
-        else:
-            punctuated_text = raw_text
-        
-        # Accumulate current utterance for complete output
-        if punctuated_text.strip():
-            self.current_utterance = punctuated_text
-        
-        # Handle EOU detection and complete utterance output
-        complete_utterance = None
-        if is_eou:
-            # Store the final complete utterance for output
-            complete_utterance = self.current_utterance.strip() if self.current_utterance.strip() else punctuated_text.strip()
             
+            # Combine both EOU detection methods
+            is_eou = is_frame_eou or is_text_eou
+            
+            # Apply punctuation if enabled
+            if self.punct_model and raw_text.strip():
+                punctuated_text = self._apply_punctuation(raw_text)
+            else:
+                punctuated_text = raw_text
+            
+            # Accumulate current utterance for complete output
+            if punctuated_text.strip():
+                self.current_utterance = punctuated_text
+            
+            # Handle EOU detection and complete utterance output
+            complete_utterance = None
+            if is_eou:
+                # Store the final complete utterance for output
+                complete_utterance = self.current_utterance.strip() if self.current_utterance.strip() else punctuated_text.strip()
+                
+                if not self.quiet_mode:
+                    eou_type = "VAD" if is_frame_eou else "Text"
+                    print(f"[{eou_type}-EOU] End of utterance confirmed, performing complete ASR reset")
+                
+                # COMPLETE ASR RESET - Reset conversation buffer and streaming state entirely
+                self.conversation_buffer = []
+                self._reset_streaming_state(reset_conversation=False)
+                
+                # Return the complete utterance for final output
+                return raw_text, punctuated_text, True, complete_utterance
+            else:
+                # Keep conversation buffer manageable
+                if len(self.conversation_buffer) > 30:
+                    self.conversation_buffer = self.conversation_buffer[-25:]
+            
+            self.step_num += 1
+            
+            return raw_text, punctuated_text, is_eou, complete_utterance
+            
+        except Exception as e:
+            print(f"ASR ERROR in transcribe_chunk: {e}")
             if not self.quiet_mode:
-                eou_type = "VAD" if is_frame_eou else "Text"
-                print(f"[{eou_type}-EOU] End of utterance confirmed, performing complete ASR reset")
-            
-            # COMPLETE ASR RESET - Reset conversation buffer and streaming state entirely
-            self.conversation_buffer = []
-            self._reset_streaming_state(reset_conversation=False)
-            
-            # Return the complete utterance for final output
-            return raw_text, punctuated_text, True, complete_utterance
-        else:
-            # Keep conversation buffer manageable
-            if len(self.conversation_buffer) > 30:
-                self.conversation_buffer = self.conversation_buffer[-25:]
-        
-        self.step_num += 1
-        
-        return raw_text, punctuated_text, is_eou, complete_utterance
+                import traceback
+                traceback.print_exc()
+            return "", "", False, None
 
 def list_audio_devices():
     """List available audio input devices"""
@@ -926,19 +991,24 @@ def list_audio_devices():
             input_devices.append(i)
             print(f"  {i}: {dev.get('name')} (channels: {dev.get('maxInputChannels')})")
     
+    # Add remote audio stream option if available
+    if REMOTE_AUDIO_AVAILABLE:
+        print(f"  remote: Remote audio stream (GStreamer RTP)")
+    
     p.terminate()
     return input_devices
 
-def run_streaming_asr_with_punct(asr_system, device_id=None, chunk_size_ms=None, show_raw=False, quiet_mode=False):
+def run_streaming_asr_with_punct(asr_system, device_id=None, chunk_size_ms=None, show_raw=False, quiet_mode=False, remote_audio_port=5004):
     """
-    Run streaming ASR with punctuation and EOU detection using microphone input
+    Run streaming ASR with punctuation and EOU detection using microphone or remote audio stream
     
     Args:
         asr_system: OnlineASRWithPunctuation instance
-        device_id: Audio device ID (None for interactive selection)
+        device_id: Audio device ID (None for interactive selection, 'remote' for remote stream)
         chunk_size_ms: Chunk size in milliseconds (None for automatic)
         show_raw: Whether to show raw (unpunctuated) text
         quiet_mode: If True, suppress all logs and only show punctuated output
+        remote_audio_port: Port for remote audio stream
     """
     # Calculate chunk size
     if chunk_size_ms is None:
@@ -946,6 +1016,185 @@ def run_streaming_asr_with_punct(asr_system, device_id=None, chunk_size_ms=None,
     
     if not quiet_mode:
         print(f"Using chunk size: {chunk_size_ms}ms")
+    
+    # Check if remote audio stream is requested
+    use_remote_audio = (device_id == 'remote' or device_id == -1) and REMOTE_AUDIO_AVAILABLE
+    
+    if use_remote_audio:
+        # Use remote audio stream
+        return run_streaming_asr_with_remote_audio(
+            asr_system, remote_audio_port, chunk_size_ms, show_raw, quiet_mode
+        )
+    else:
+        # Use local microphone (existing code)
+        return run_streaming_asr_with_microphone(
+            asr_system, device_id, chunk_size_ms, show_raw, quiet_mode
+        )
+
+def run_streaming_asr_with_remote_audio(asr_system, remote_port, chunk_size_ms, show_raw, quiet_mode):
+    """Run streaming ASR using remote audio stream - PyAudio compatible"""
+    
+    if not quiet_mode:
+        print(f"Starting remote audio stream receiver on port {remote_port}")
+        print("Waiting for audio stream from remote device...")
+    
+    # Initialize remote audio stream
+    remote_stream = RemoteAudioStream(
+        listen_port=remote_port, 
+        sample_rate=SAMPLE_RATE, 
+        verbose=not quiet_mode
+    )
+    
+    if not remote_stream.start():
+        print("ERROR: Failed to start remote audio stream")
+        return
+    
+    try:
+        # Calculate frames per buffer - EXACTLY like PyAudio
+        frames_per_buffer = int(SAMPLE_RATE * chunk_size_ms / 1000) - 1
+        
+        if not quiet_mode:
+            print(f"Remote audio stream started successfully")
+            print(f"Frames per buffer: {frames_per_buffer} (matching PyAudio)")
+            print(f"Chunk size: {chunk_size_ms}ms")
+            print("Listening for audio... (Press Ctrl+C to stop)")
+            print('=' * 50)
+        
+        # Store last transcription to avoid repetition
+        last_raw = ""
+        last_punct = ""
+        
+        # Processing statistics
+        chunks_processed = 0
+        consecutive_errors = 0
+        max_consecutive_errors = 3
+        transcription_count = 0
+        
+        # Main processing loop - modeled after PyAudio callback
+        while True:
+            try:
+                # Read exactly frames_per_buffer samples - like PyAudio callback
+                audio_chunk = remote_stream.read_audio_pyaudio_compatible(
+                    chunk_size=frames_per_buffer,
+                    timeout=1.0
+                )
+                
+                if audio_chunk is not None:
+                    # Verify chunk size consistency
+                    if len(audio_chunk) != frames_per_buffer:
+                        print(f"ERROR: Chunk size inconsistency - expected {frames_per_buffer}, got {len(audio_chunk)}")
+                        continue
+                    
+                    chunks_processed += 1
+                    
+                    # Debug chunk format periodically
+                    if not quiet_mode and chunks_processed % 50 == 0:
+                        rms = np.sqrt(np.mean(audio_chunk.astype(np.float32) ** 2))
+                        print(f"CHUNK #{chunks_processed}: {len(audio_chunk)} samples, "
+                              f"dtype={audio_chunk.dtype}, range=[{np.min(audio_chunk)}, {np.max(audio_chunk)}], "
+                              f"RMS={rms:.0f}")
+                    
+                    # Process audio chunk with ASR - exactly like PyAudio callback
+                    raw_text, punct_text, is_eou, complete_utterance = asr_system.transcribe_chunk(audio_chunk)
+                    
+                    # Debug ASR output
+                    if raw_text.strip():
+                        transcription_count += 1
+                        if not quiet_mode:
+                            print(f"ASR OUTPUT #{transcription_count}: '{raw_text}' -> '{punct_text}'")
+                    elif chunks_processed % 100 == 0 and not quiet_mode:
+                        print(f"ASR: No transcription for chunk #{chunks_processed} (total transcriptions: {transcription_count})")
+                    
+                    # Reset error counter on successful processing
+                    consecutive_errors = 0
+                    
+                    # Handle EOU - output complete utterance with clear separators
+                    if is_eou and complete_utterance:
+                        if quiet_mode:
+                            print(f"\n{'='*70}")
+                            print(f"COMPLETE UTTERANCE:")
+                            print(f"{'='*70}")
+                            print(f"{complete_utterance}")
+                            print(f"{'='*70}\n")
+                        else:
+                            print(f"\n{'='*70}")
+                            print(f"[COMPLETE UTTERANCE - ASR FULLY RESET]")
+                            print(f"{complete_utterance}")
+                            print(f"{'='*70}")
+                        
+                        # Reset tracking variables for fresh start
+                        last_raw = ""
+                        last_punct = ""
+                        continue
+                    
+                    # Only print if text has changed and it's not an EOU
+                    if raw_text.strip() and raw_text != last_raw and not is_eou:
+                        if quiet_mode:
+                            if punct_text.strip() and len(punct_text.split()) > len(last_punct.split() if last_punct else []):
+                                print(f"\r{punct_text}", end='', flush=True)
+                        else:
+                            if show_raw:
+                                print(f"\rRaw: {raw_text}", end='')
+                                if punct_text != raw_text:
+                                    print(f" | Punct: {punct_text}", end='', flush=True)
+                                else:
+                                    print('', end='', flush=True)
+                            else:
+                                print(f"\r{punct_text}", end='', flush=True)
+                        
+                        last_raw = raw_text
+                        last_punct = punct_text
+                
+                else:
+                    # No audio data received - check stream status
+                    if not quiet_mode and chunks_processed % 100 == 0:
+                        status = remote_stream.get_status()
+                        print(f"\rWaiting for audio data... (connected: {status['connected']}, queue: {status['queue_size']}, chunks: {chunks_processed})", end='', flush=True)
+                    
+                    # Small delay to prevent busy waiting
+                    time.sleep(0.01)
+                        
+            except Exception as e:
+                consecutive_errors += 1
+                print(f"\nERROR processing audio chunk #{chunks_processed}: {e}")
+                if not quiet_mode:
+                    if consecutive_errors <= 2:  # Only show traceback for first few errors
+                        import traceback
+                        traceback.print_exc()
+                
+                # If we have too many consecutive errors, do a complete system reset
+                if consecutive_errors >= max_consecutive_errors:
+                    print(f"ERROR: {consecutive_errors} consecutive errors - performing complete system reset")
+                    
+                    # Clear all state
+                    last_raw = ""
+                    last_punct = ""
+                    
+                    # Complete ASR reset
+                    try:
+                        asr_system._reset_streaming_state(reset_conversation=True)
+                        print("ASR system reset completed")
+                        consecutive_errors = 0  # Reset error counter after system reset
+                    except Exception as reset_error:
+                        print(f"ERROR: Failed to reset ASR system: {reset_error}")
+                        break  # Exit on critical failure
+                else:
+                    # Small delay before continuing to prevent rapid error cycling
+                    time.sleep(0.1)
+            
+    except KeyboardInterrupt:
+        if not quiet_mode:
+            print('\n\nStopping remote audio stream...')
+    finally:
+        remote_stream.stop()
+        if not quiet_mode:
+            print("Remote audio stream stopped")
+            if chunks_processed > 0:
+                print(f"Total chunks processed: {chunks_processed}")
+                print(f"Total transcriptions: {transcription_count}")
+
+def run_streaming_asr_with_microphone(asr_system, device_id, chunk_size_ms, show_raw, quiet_mode):
+    """Run streaming ASR using local microphone (original implementation)"""
     
     # Initialize PyAudio
     p = pa.PyAudio()
@@ -1042,9 +1291,9 @@ def run_streaming_asr_with_punct(asr_system, device_id=None, chunk_size_ms=None,
                             print('', end='', flush=True)
                     else:
                         print(f"\r{punct_text}", end='', flush=True)
-                
-                last_raw = raw_text
-                last_punct = punct_text
+            
+            last_raw = raw_text
+            last_punct = punct_text
             
             return (in_data, pa.paContinue)
         
@@ -1100,15 +1349,19 @@ Available ASR models:
 Available punctuation models:
 {chr(10).join(f"  - {model}" for model in AVAILABLE_PUNCT_MODELS)}
 
+Audio Input Options:
+  - Local microphone: specify device ID (use --list-devices to see options)
+  - Remote audio stream: use --device remote (requires GStreamer RTP stream)
+
 Examples:
+  # Use remote audio stream (GStreamer RTP)
+  python {__file__} --device remote --remote-port 5004
+
+  # Use local microphone with device ID
+  python {__file__} --device 0
+
   # Basic usage with VAD-based EOU detection
   python {__file__} --asr-model stt_en_fastconformer_hybrid_large_streaming_multi --punct-model punctuation_en_bert
-
-  # Adjust VAD-based EOU sensitivity
-  python {__file__} --vad-silence-threshold 10 --vad-speech-threshold 0.4
-
-  # Disable text-based EOU, use only VAD-based
-  python {__file__} --no-text-eou
         """
     )
     
@@ -1142,8 +1395,14 @@ Examples:
     
     parser.add_argument(
         "--device", 
+        help="Audio device ID (number for microphone, 'remote' for remote stream, will prompt if not provided)"
+    )
+    
+    parser.add_argument(
+        "--remote-port",
         type=int,
-        help="Audio device ID (will prompt if not provided)"
+        default=5004,
+        help="Port for remote audio stream (default: 5004)"
     )
     
     parser.add_argument(
@@ -1238,6 +1497,20 @@ Examples:
         list_audio_devices()
         return
     
+    # Handle device selection
+    device_id = args.device
+    if device_id == 'remote':
+        if not REMOTE_AUDIO_AVAILABLE:
+            print("ERROR: Remote audio stream not available. Please install required dependencies.")
+            return
+        device_id = 'remote'
+    elif device_id is not None:
+        try:
+            device_id = int(device_id)
+        except ValueError:
+            print(f"ERROR: Invalid device ID '{args.device}'. Use 'remote' for remote stream or a number for microphone.")
+            return
+    
     # Set up comprehensive quiet mode before any model loading
     if args.quiet:
         # Suppress all possible logging early
@@ -1314,14 +1587,19 @@ Examples:
             print(f"EOU Detection: {'Enabled' if not args.no_eou else 'Disabled'}")
             print(f"Lookahead: {args.lookahead}ms")
             print(f"Decoder: {args.decoder}")
+            if device_id == 'remote':
+                print(f"Audio Input: Remote stream (port {args.remote_port})")
+            else:
+                print(f"Audio Input: {'Auto-select microphone' if device_id is None else f'Device {device_id}'}")
         
         # Run streaming ASR
         run_streaming_asr_with_punct(
             asr_system=asr_system,
-            device_id=args.device,
+            device_id=device_id,
             chunk_size_ms=args.chunk_size,
             show_raw=args.show_raw,
-            quiet_mode=args.quiet
+            quiet_mode=args.quiet,
+            remote_audio_port=args.remote_port
         )
         
     except KeyboardInterrupt:

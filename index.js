@@ -20,8 +20,6 @@ if (!process.env.BEDROCK_MODEL_ID) {
   console.warn('WARNING: BEDROCK_MODEL_ID environment variable is not set')
 }
 
-const RMIT_INFO_ONLY = + (process.env.RMIT_INFO_ONLY ?? 1)
-
 async function handleKnowledgeBaseSearch ({ query }) {
   if (!query) {
     return {
@@ -197,9 +195,6 @@ You must never use WebSearch or return information retrieved from the internet.
 `
 
 
-const ENABLE_REALTIME_SEARCH = + process.env.ENABLE_REALTIME_SEARCH || 0
-const SYSTEM_PROMPT = ENABLE_REALTIME_SEARCH ? SYSTEM_PROMPT_WITH_WEBSEARCH : SYSTEM_PROMPT_WITHOUT_WEBSEARCH
-
 const KNOWLEDGE_BASE_TOOL = {
   toolSpec: {
     name: "KnowledgeBaseSearch",
@@ -247,7 +242,7 @@ async function sendChunk (data) {
   }
 }
 
-function getInput (messages, disableTools = false, deepSearch = false) {
+function getInput (messages, disableTools = false) {
   const input = {
     modelId: process.env.BEDROCK_MODEL_ID,
     inferenceConfig: {
@@ -257,29 +252,25 @@ function getInput (messages, disableTools = false, deepSearch = false) {
     messages,
     system: [
       {
-        text: deepSearch
-          ? SYSTEM_PROMPT_WITHOUT_WEBSEARCH
-          : SYSTEM_PROMPT_QUICK
+        text: SYSTEM_PROMPT_QUICK
       }
     ]
   }
 
   if (!disableTools) {
     input.toolConfig = {
-      tools: deepSearch
-        ? TOOLS // In Deep Search mode, both KnowledgeBaseSearch and WebSearch are available
-        : [KNOWLEDGE_BASE_TOOL] // In Quick Mode, only KnowledgeBaseSearch is available
+      tools: [KNOWLEDGE_BASE_TOOL]
     }
   }
 
   return input
 }
 
-async function invokeBedrockModel (messages, prompt, chunkCount, disableTools = false, quickMode = false) {
+async function invokeBedrockModel (messages, prompt, chunkCount, disableTools = false) {
   console.log("input.messages before model call:\\n", JSON.stringify(messages, null, 2))
   console.log("invokeBedrockModel - BEDROCK_MODEL_ID:", process.env.BEDROCK_MODEL_ID)
   try {
-    const input = getInput(messages, disableTools, quickMode)
+    const input = getInput(messages, disableTools)
     console.log("invokeBedrockModel - input.modelId:", input.modelId)
     if (prompt) {
       const userMessageWithToolResult = input.messages.pop()
@@ -380,21 +371,6 @@ async function invokeBedrockModel (messages, prompt, chunkCount, disableTools = 
               }]
             })
 
-            if (toolUse.name === 'WebSearch') {
-              const contentObject = {
-                query: toolUse.input.query,
-                results: result.results
-              }
-
-              const contentString = JSON.stringify(contentObject)
-
-              await sendChunk({
-                content: `<Thinking><ToolUse data-name="WebsearchResult" data-id="${toolUse.toolUseId}" data-content='${contentString.replace(/'/g, "&apos;")}' /></Thinking>`,
-                isFinished: false,
-                chunkNumber: chunkCount++
-              })
-            }
-
             return { isFinished: false, chunkCount }
           } catch (toolError) {
             console.error('Error processing tool call:', toolError)
@@ -440,7 +416,7 @@ async function invokeBedrockModel (messages, prompt, chunkCount, disableTools = 
   }
 }
 
-async function startCompletion ({ history, deepSearch = false }) {
+async function startCompletion ({ history }) {
   try {
     sessionId = Math.random().toString(32).slice(2)
     const maxIterations = process.env.MAX_ITERATIONS || 5
@@ -460,8 +436,7 @@ async function startCompletion ({ history, deepSearch = false }) {
         messages,
         disableTools && "Please provide final answer...",
         chunkCount,
-        disableTools,
-        deepSearch
+        disableTools
       )
       chunkCount = newChunkCount
       if (isFinished) {
@@ -510,10 +485,10 @@ export const handler = async (event) => {
   connectionId = requestContext.connectionId
 
   const jsonBody = JSON.parse(body)
-  const { action, deepSearch = false } = jsonBody
+  const { action } = jsonBody
 
   switch (action) {
     case 'completion':
-      return await startCompletion({ ...jsonBody, deepSearch })
+      return await startCompletion({ ...jsonBody })
   }
 }
