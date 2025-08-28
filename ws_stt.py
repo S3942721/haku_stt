@@ -471,7 +471,7 @@ class FrameLevelSpeechDetector:
             "avg_activity": analysis["speech_proportion"],
             "speech_frames": analysis["speech_frames"],
             "total_frames": analysis["total_frames"],
-            "avg_confidence": analysis["speech_proportion"]  # For compatibility
+            "avg_confidence": analysis["speech_proportion"]
         }
     
     def has_recent_speech_activity(self, lookback_seconds=1.0):
