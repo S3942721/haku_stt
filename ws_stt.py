@@ -512,6 +512,8 @@ class WebSocketServer:
         self.loop = None
         self.thread = None
         self.running = False
+        # Add command queue for processing control commands
+        self.command_queue = queue.Queue()
         
     async def register_client(self, websocket):
         """Register a new WebSocket client"""
@@ -528,8 +530,26 @@ class WebSocketServer:
             }
             await websocket.send(json.dumps(welcome_msg))
             
-            # Wait for client to disconnect
-            await websocket.wait_closed()
+            # Handle incoming messages
+            async for message in websocket:
+                try:
+                    command = json.loads(message)
+                    await self.handle_command(command, websocket)
+                except json.JSONDecodeError:
+                    error_msg = {
+                        "type": "error",
+                        "error": "Invalid JSON format",
+                        "timestamp": time.time()
+                    }
+                    await websocket.send(json.dumps(error_msg))
+                except Exception as e:
+                    error_msg = {
+                        "type": "error", 
+                        "error": str(e),
+                        "timestamp": time.time()
+                    }
+                    await websocket.send(json.dumps(error_msg))
+                    
         except websockets.exceptions.ConnectionClosed:
             pass
         except Exception as e:
@@ -540,6 +560,62 @@ class WebSocketServer:
                 self.clients.remove(websocket)
             if not self.quiet_mode:
                 print(f"WebSocket client disconnected")
+    
+    async def handle_command(self, command, websocket):
+        """Handle incoming commands from WebSocket clients"""
+        if not isinstance(command, dict) or "type" not in command:
+            await websocket.send(json.dumps({
+                "type": "error",
+                "error": "Command must be a JSON object with 'type' field",
+                "timestamp": time.time()
+            }))
+            return
+        
+        command_type = command.get("type")
+        
+        if command_type == "control":
+            action = command.get("action")
+            if action in ["pause", "resume", "purge", "reset"]:
+                # Add command to queue for main thread processing
+                self.command_queue.put({
+                    "action": action,
+                    "timestamp": time.time(),
+                    "client": websocket.remote_address if hasattr(websocket, 'remote_address') else "unknown"
+                })
+                
+                # Send acknowledgment
+                response = {
+                    "type": "command_ack",
+                    "action": action,
+                    "status": "queued",
+                    "timestamp": time.time()
+                }
+                await websocket.send(json.dumps(response))
+                
+                if not self.quiet_mode:
+                    print(f"WebSocket command received: {action}")
+            else:
+                await websocket.send(json.dumps({
+                    "type": "error",
+                    "error": f"Unknown control action: {action}",
+                    "timestamp": time.time()
+                }))
+        else:
+            await websocket.send(json.dumps({
+                "type": "error", 
+                "error": f"Unknown command type: {command_type}",
+                "timestamp": time.time()
+            }))
+    
+    def get_pending_commands(self):
+        """Get all pending commands from the queue"""
+        commands = []
+        while not self.command_queue.empty():
+            try:
+                commands.append(self.command_queue.get_nowait())
+            except queue.Empty:
+                break
+        return commands
     
     async def broadcast_message(self, message):
         """Broadcast message to all connected clients"""
@@ -719,6 +795,10 @@ class OnlineASRWithPunctuation:
         self.quiet_mode = quiet_mode
         self.enable_eou = enable_eou
         self.websocket_server = websocket_server
+        
+        # Add processing control state
+        self.is_paused = False
+        self.last_control_check = time.time()
         
         # Comprehensive logging suppression for quiet mode
         if quiet_mode:
@@ -903,6 +983,13 @@ class OnlineASRWithPunctuation:
         # Reset current utterance accumulation
         self.current_utterance = ""
         
+        # Send reset notification via WebSocket
+        if self.websocket_server:
+            self.websocket_server.send_status_update(
+                "reset",
+                {"conversation_reset": reset_conversation, "timestamp": time.time()}
+            )
+        
         if not self.quiet_mode:
             print("Complete ASR streaming state reset")
     
@@ -1050,6 +1137,13 @@ class OnlineASRWithPunctuation:
         Returns:
             tuple: (raw_text, punctuated_text, is_eou, complete_utterance)
         """
+        # Check for WebSocket commands
+        self._check_websocket_commands()
+        
+        # If paused, return empty results without processing
+        if self.is_paused:
+            return "", "", False, None
+        
         try:
             # Debug audio chunk input
             if not self.quiet_mode and self.step_num % 50 == 0:
@@ -1195,7 +1289,79 @@ class OnlineASRWithPunctuation:
                 import traceback
                 traceback.print_exc()
             return "", "", False, None
-
+    
+    def _check_websocket_commands(self):
+        """Check for and process WebSocket commands"""
+        if not self.websocket_server:
+            return
+        
+        # Only check commands periodically to avoid performance impact
+        current_time = time.time()
+        if current_time - self.last_control_check < 0.1:  # Check every 100ms
+            return
+        
+        self.last_control_check = current_time
+        
+        commands = self.websocket_server.get_pending_commands()
+        for command in commands:
+            action = command.get("action")
+            
+            if action == "pause":
+                if not self.is_paused:
+                    self.is_paused = True
+                    # Purge current utterance and reset when pausing
+                    self._purge_and_reset()
+                    if not self.quiet_mode:
+                        print("[CONTROL] Processing paused and utterance purged")
+                    self.websocket_server.send_status_update(
+                        "paused", 
+                        {"action": "pause", "purged": True, "timestamp": time.time()}
+                    )
+                    
+            elif action == "resume":
+                if self.is_paused:
+                    self.is_paused = False
+                    if not self.quiet_mode:
+                        print("[CONTROL] Processing resumed")
+                    self.websocket_server.send_status_update(
+                        "resumed",
+                        {"action": "resume", "timestamp": time.time()}
+                    )
+                    
+            elif action == "purge":
+                self._purge_and_reset()
+                if not self.quiet_mode:
+                    print("[CONTROL] Current utterance purged and ASR reset")
+                self.websocket_server.send_status_update(
+                    "purged",
+                    {"action": "purge", "timestamp": time.time()}
+                )
+                
+            elif action == "reset":
+                self._purge_and_reset()
+                if not self.quiet_mode:
+                    print("[CONTROL] Complete system reset performed")
+                self.websocket_server.send_status_update(
+                    "reset_complete",
+                    {"action": "reset", "timestamp": time.time()}
+                )
+    
+    def _purge_and_reset(self):
+        """Purge current utterance and reset ASR and EOU detection"""
+        # Reset conversation buffer and streaming state
+        self.conversation_buffer = []
+        self.current_utterance = ""
+        self._reset_streaming_state(reset_conversation=True)
+        
+        # Reset frame detector state
+        if self.frame_detector:
+            self.frame_detector.speech_frame_history.clear()
+            self.frame_detector.reset_silence_tracking()
+        
+        # Reset EOU detector state
+        if self.eou_detector:
+            self.eou_detector.recent_detections = []
+    
 def list_audio_devices():
     """List available audio input devices"""
     p = pa.PyAudio()
@@ -1297,6 +1463,14 @@ def run_streaming_asr_with_remote_audio(asr_system, remote_port, chunk_size_ms, 
         # Main processing loop - modeled after PyAudio callback
         while True:
             try:
+                # Check for WebSocket commands even when no audio
+                asr_system._check_websocket_commands()
+                
+                # If paused, skip audio processing but continue checking commands
+                if asr_system.is_paused:
+                    time.sleep(0.1)
+                    continue
+                
                 # Read exactly frames_per_buffer samples - like PyAudio callback
                 audio_chunk = remote_stream.read_audio_pyaudio_compatible(
                     chunk_size=frames_per_buffer,
@@ -1372,7 +1546,8 @@ def run_streaming_asr_with_remote_audio(asr_system, remote_port, chunk_size_ms, 
                     # No audio data received - check stream status
                     if not quiet_mode and chunks_processed % 100 == 0:
                         status = remote_stream.get_status()
-                        print(f"\rWaiting for audio data... (connected: {status['connected']}, queue: {status['queue_size']}, chunks: {chunks_processed})", end='', flush=True)
+                        pause_indicator = " [PAUSED]" if asr_system.is_paused else ""
+                        print(f"\rWaiting for audio data... (connected: {status['connected']}, queue: {status['queue_size']}, chunks: {chunks_processed}){pause_indicator}", end='', flush=True)
                     
                     # Small delay to prevent busy waiting
                     time.sleep(0.01)
@@ -1471,6 +1646,13 @@ def run_streaming_asr_with_microphone(asr_system, device_id, chunk_size_ms, show
         def stream_callback(in_data, frame_count, time_info, status):
             nonlocal last_raw, last_punct
             
+            # Check for WebSocket commands
+            asr_system._check_websocket_commands()
+            
+            # If paused, return silence without processing
+            if asr_system.is_paused:
+                return (in_data, pa.paContinue)
+            
             if status and not quiet_mode:
                 print(f"Stream status: {status}")
                 
@@ -1533,6 +1715,11 @@ def run_streaming_asr_with_microphone(asr_system, device_id, chunk_size_ms, show
         
         if not quiet_mode:
             print('\nListening... (Press Ctrl+C to stop)')
+            print('Send WebSocket commands to control processing:')
+            print('  {"type": "control", "action": "pause"}   - Pause processing and purge utterance')
+            print('  {"type": "control", "action": "resume"}  - Resume processing')
+            print('  {"type": "control", "action": "purge"}   - Purge current utterance and reset')
+            print('  {"type": "control", "action": "reset"}   - Complete system reset')
             if asr_system.punct_model:
                 print('Punctuation and capitalization enabled')
             else:
@@ -1875,9 +2062,6 @@ Examples:
         if websocket_server:
             websocket_server.send_status_update("stopped")
             websocket_server.stop_server()
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
