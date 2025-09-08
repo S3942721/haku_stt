@@ -1260,32 +1260,34 @@ class OnlineASRWithPunctuation:
             # Handle EOU detection and complete utterance output
             complete_utterance = None
             if is_eou:
-                # Store the final complete utterance for output
-                complete_utterance = self.current_utterance.strip() if self.current_utterance.strip() else punctuated_text.strip()
+                # Check if there was recent speech activity or accumulated utterance text
+                has_recent_speech = self.frame_detector.has_recent_speech_activity(lookback_seconds=2.0)
+                has_accumulated_text = bool(self.current_utterance.strip())
                 
-                # Send complete utterance via WebSocket
-                if self.websocket_server and complete_utterance:
-                    self.websocket_server.send_complete_utterance(complete_utterance)
-                
-                if not self.quiet_mode:
-                    eou_type = "VAD" if is_frame_eou else "Text"
-                    print(f"[{eou_type}-EOU] End of utterance confirmed, performing complete ASR reset")
-                
-                # COMPLETE ASR RESET - Reset conversation buffer and streaming state entirely
-                self.conversation_buffer = []
-                self._reset_streaming_state(reset_conversation=False)
-                
-                # Return the complete utterance for final output
-                return raw_text, punctuated_text, True, complete_utterance
-            else:
-                # Keep conversation buffer manageable
-                if len(self.conversation_buffer) > 30:
-                    self.conversation_buffer = self.conversation_buffer[-25:]
-            
+                if has_recent_speech or has_accumulated_text:
+                    # Store the final complete utterance for output
+                    complete_utterance = self.current_utterance.strip() if self.current_utterance.strip() else punctuated_text.strip()
+                    
+                    # Send complete utterance via WebSocket
+                    if self.websocket_server and complete_utterance:
+                        self.websocket_server.send_complete_utterance(complete_utterance)
+                    
+                    if not self.quiet_mode:
+                        eou_type = "VAD" if is_frame_eou else "Text"
+                        print(f"[{eou_type}-EOU] End of utterance confirmed with recent speech or accumulated text, performing complete ASR reset")
+                    
+                    # COMPLETE ASR RESET - Reset conversation buffer and streaming state entirely
+                    self.conversation_buffer = []
+                    self._reset_streaming_state(reset_conversation=False)
+                else:
+                    if not self.quiet_mode:
+                        print(f"[EOU] EOU detected but no recent speech activity or accumulated text - skipping reset")
+                    # Don't reset, just continue processing
+                    complete_utterance = None
+
             self.step_num += 1
             
             return raw_text, punctuated_text, is_eou, complete_utterance
-            
         except Exception as e:
             print(f"ASR ERROR in transcribe_chunk: {e}")
             if not self.quiet_mode:
@@ -1808,7 +1810,7 @@ def get_hardcoded_defaults():
         "vad-silence-threshold": 15,
         "vad-speech-threshold": 0.5,
         "vad-activity-threshold": 0.3,
-        "no-text-eou": False,
+        "enable-text-eou": False,
         "vad-speech-proportion-threshold": 0.2,
         "vad-analysis-window": 2.0,
         "vad-consecutive-silence-threshold": 0.8,
@@ -1918,7 +1920,7 @@ def main():
     vad_silence_threshold = config["vad-silence-threshold"]
     vad_speech_threshold = config["vad-speech-threshold"]
     vad_activity_threshold = config["vad-activity-threshold"]
-    no_text_eou = config["no-text-eou"]
+    enable_text_eou = config["enable-text-eou"]
     vad_speech_proportion_threshold = config["vad-speech-proportion-threshold"]
     vad_analysis_window = config["vad-analysis-window"]
     vad_consecutive_silence_threshold = config["vad-consecutive-silence-threshold"]
@@ -1984,20 +1986,20 @@ def main():
                 print(f"  Frames per window: {asr_system.frame_detector.frames_per_analysis_window}")
         
         # Disable text-based EOU if requested
-        if no_text_eou:
+        if not enable_text_eou:
             asr_system.eou_detector = None
             if not quiet_mode:
                 print("Text-based EOU detection disabled")
         
         # Update EOU threshold if specified
-        if asr_system.eou_detector and not no_text_eou:
+        if asr_system.eou_detector and enable_text_eou:
             asr_system.eou_detector.threshold = eou_threshold
     
         if not quiet_mode:
             print("\nASR system ready!")
             print(f"ASR Model: {asr_model}")
             print(f"Punctuation Model: {punct_model or 'None'}")
-            print(f"EOU Detection: {'Enabled' if not no_text_eou else 'Disabled'}")
+            print(f"Text EOU Detection: {'Enabled' if enable_text_eou else 'Disabled'}")
             print(f"Lookahead: {lookahead}ms")
             print(f"Decoder: {decoder}")
             if device_id == 'remote':
@@ -2006,7 +2008,7 @@ def main():
                 print(f"Audio Input: {'Auto-select microphone' if device_id is None else f'Device {device_id}'}")
             if websocket_server:
                 print(f"WebSocket Output: ws://{websocket_host}:{websocket_port}")
-        
+    
         # Run streaming ASR with config values
         run_streaming_asr_with_punct(
             asr_system=asr_system,

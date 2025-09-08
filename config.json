@@ -15,7 +15,7 @@
     "vad-silence-threshold": "Number of consecutive low-activity frames needed for VAD-based EOU detection",
     "vad-speech-threshold": "VAD probability threshold for speech detection (0.0-1.0)",
     "vad-activity-threshold": "Minimum frame activity ratio for speech detection (0.0-1.0)",
-    "no-text-eou": "Disable text-based EOU detection, use only frame-based detection",
+    "enable-text-eou": "Enable text-based EOU detection",
     "vad-speech-proportion-threshold": "Speech proportion threshold for EOU detection (0.0-1.0, lower = more sensitive)",
     "vad-analysis-window": "Analysis window in seconds for speech proportion calculation",
     "vad-consecutive-silence-threshold": "Consecutive silence duration in seconds needed for immediate EOU detection",
@@ -38,7 +38,7 @@
       "vad-silence-threshold": 15,
       "vad-speech-threshold": 0.5,
       "vad-activity-threshold": 0.3,
-      "no-text-eou": false,
+      "enable-text-eou": false,
       "vad-speech-proportion-threshold": 0.2,
       "vad-analysis-window": 2.0,
       "vad-consecutive-silence-threshold": 0.8,
@@ -62,11 +62,7 @@
       "eou-threshold": 0.9
     },
     "reliable": {
-      "punct-model": "punctuation_en_distilbert",
-      "vad-speech-threshold": 0.6,
-      "vad-speech-proportion-threshold": 0.3,
-      "vad-analysis-window": 2.5,
-      "no-text-eou": true
+      "enable-text-eou": false
     }
   }
 }
