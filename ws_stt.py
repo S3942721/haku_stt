@@ -1201,11 +1201,14 @@ class OnlineASRWithPunctuation:
                         return_transcription=True,
                     )
                     
-                    # Debug ASR model output
-                    if not self.quiet_mode and self.step_num % 50 == 0:
-                        print(f"ASR DEBUG: Model output - transcribed_texts: {transcribed_texts}, "
-                              f"type: {type(transcribed_texts)}")
-                        
+                    # Debug ASR model output (huge output, so limit frequency)
+                    if not self.quiet_mode and self.step_num % 200 == 0:
+                        # print(f"ASR DEBUG: Model output - transcribed_texts: {transcribed_texts}, "
+                        #       f"type: {type(transcribed_texts)}")
+                        print(f"ASR DEBUG: Model output - transcribed_texts type: {type(transcribed_texts)}")
+                        if isinstance(transcribed_texts, list):
+                            print(f"ASR DEBUG: Model output - transcribed_texts length: {len(transcribed_texts)}")
+
                 except Exception as asr_error:
                     print(f"ASR ERROR in conformer_stream_step: {asr_error}")
                     if not self.quiet_mode:
