@@ -1,0 +1,72 @@
+{
+  "mode-selection": "default",
+  "descriptions": {
+    "asr-model": "ASR model name to use",
+    "punct-model": "Punctuation model name (None to disable punctuation)",
+    "lookahead": "Lookahead size in milliseconds (0, 80, 480, 1040 for multi model)",
+    "decoder": "ASR decoder type to use (\"rnnt\" or \"ctc\")",
+    "device": "Audio device ID (number for microphone, 'remote' for remote stream, will prompt if not provided)",
+    "remote-port": "Port for remote audio stream (default: 5004)",
+    "chunk-size": "Chunk size in milliseconds (auto-calculated if not provided)",
+    "show-raw": "Show both raw and punctuated text",
+    "quiet": "Quiet mode: suppress all logs and only show punctuated text output",
+    "no-eou": "Disable end-of-utterance detection",
+    "eou-threshold": "Threshold for end-of-utterance detection (0.0-1.0, higher = less sensitive)",
+    "vad-silence-threshold": "Number of consecutive low-activity frames needed for VAD-based EOU detection",
+    "vad-speech-threshold": "VAD probability threshold for speech detection (0.0-1.0)",
+    "vad-activity-threshold": "Minimum frame activity ratio for speech detection (0.0-1.0)",
+    "no-text-eou": "Disable text-based EOU detection, use only frame-based detection",
+    "vad-speech-proportion-threshold": "Speech proportion threshold for EOU detection (0.0-1.0, lower = more sensitive)",
+    "vad-analysis-window": "Analysis window in seconds for speech proportion calculation",
+    "vad-consecutive-silence-threshold": "Consecutive silence duration in seconds needed for immediate EOU detection",
+    "websocket-host": "WebSocket server host (enables WebSocket output when specified)",
+    "websocket-port": "WebSocket server port (default: 8765)"
+  },
+  "modes": {
+    "default": {
+      "asr-model": "stt_en_fastconformer_hybrid_large_streaming_multi",
+      "punct-model": "punctuation_en_bert",
+      "lookahead": 480,
+      "decoder": "rnnt",
+      "device": null,
+      "remote-port": 5004,
+      "chunk-size": null,
+      "show-raw": false,
+      "quiet": false,
+      "no-eou": false,
+      "eou-threshold": 0.8,
+      "vad-silence-threshold": 15,
+      "vad-speech-threshold": 0.5,
+      "vad-activity-threshold": 0.3,
+      "no-text-eou": false,
+      "vad-speech-proportion-threshold": 0.2,
+      "vad-analysis-window": 2.0,
+      "vad-consecutive-silence-threshold": 0.8,
+      "websocket-host": "10.0.0.2",
+      "websocket-port": 8765
+    },
+    "fast": {
+      "asr-model": "stt_en_fastconformer_hybrid_large_streaming_80ms",
+      "lookahead": 80,
+      "chunk-size": 80,
+      "vad-analysis-window": 1.0,
+      "vad-consecutive-silence-threshold": 0.5,
+      "quiet": true
+    },
+    "slow": {
+      "asr-model": "stt_en_fastconformer_hybrid_large_streaming_1040ms",
+      "lookahead": 1040,
+      "chunk-size": 1040,
+      "vad-analysis-window": 3.0,
+      "vad-consecutive-silence-threshold": 1.0,
+      "eou-threshold": 0.9
+    },
+    "reliable": {
+      "punct-model": "punctuation_en_distilbert",
+      "vad-speech-threshold": 0.6,
+      "vad-speech-proportion-threshold": 0.3,
+      "vad-analysis-window": 2.5,
+      "no-text-eou": true
+    }
+  }
+}

@@ -1613,7 +1613,16 @@ def run_streaming_asr_with_microphone(asr_system, device_id, chunk_size_ms, show
             if not quiet_mode:
                 print('ERROR: No audio input device found.')
             return
-            
+        
+        # Convert device_id to int if it's a valid number (not None or 'remote')
+        if device_id is not None and device_id != 'remote':
+            try:
+                device_id = int(device_id)
+            except ValueError:
+                if not quiet_mode:
+                    print(f"Error: Invalid device ID '{device_id}'. Must be a number or 'remote'.")
+                return
+        
         if device_id is None:
             if not quiet_mode:
                 device_id = -1
@@ -1627,13 +1636,16 @@ def run_streaming_asr_with_microphone(asr_system, device_id, chunk_size_ms, show
                 # In quiet mode, use the first available device
                 device_id = input_devices[0]
         
-        if device_id not in input_devices:
+        if device_id not in input_devices and device_id != 'remote':
             if not quiet_mode:
                 print(f"Error: Device {device_id} not found in available input devices")
             return
             
         if not quiet_mode:
-            print(f"Using device {device_id}: {p.get_device_info_by_index(device_id)['name']}")
+            if device_id == 'remote':
+                print("Using remote audio stream")
+            else:
+                print(f"Using device {device_id}: {p.get_device_info_by_index(device_id)['name']}")
         
         # Calculate frames per buffer
         frames_per_buffer = int(SAMPLE_RATE * chunk_size_ms / 1000) - 1
@@ -1748,305 +1760,258 @@ def run_streaming_asr_with_microphone(asr_system, device_id, chunk_size_ms, show
     finally:
         p.terminate()
 
-def main():
+def load_config(config_path):
+    """Load and validate configuration from JSON file"""
+    if not os.path.exists(config_path):
+        print(f"Warning: Config file '{config_path}' not found. Using hardcoded defaults.")
+        return get_hardcoded_defaults()
+    
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        # Validate structure
+        if "mode-selection" not in config or "modes" not in config:
+            raise ValueError("Config must contain 'mode-selection' and 'modes'")
+        
+        selected_mode = config["mode-selection"]
+        if selected_mode not in config["modes"]:
+            raise ValueError(f"Selected mode '{selected_mode}' not found in modes")
+        
+        # Merge default with selected mode overrides
+        default_settings = config["modes"]["default"]
+        mode_overrides = config["modes"][selected_mode]
+        merged_settings = {**default_settings, **mode_overrides}
+        
+        return merged_settings
+    except Exception as e:
+        print(f"Error loading config: {e}. Using hardcoded defaults.")
+        return get_hardcoded_defaults()
+
+def get_hardcoded_defaults():
+    """Fallback hardcoded defaults matching original script"""
+    return {
+        "asr-model": "stt_en_fastconformer_hybrid_large_streaming_multi",
+        "punct-model": "punctuation_en_bert",
+        "lookahead": 480,
+        "decoder": "rnnt",
+        "device": None,
+        "remote-port": 5004,
+        "chunk-size": None,
+        "show-raw": False,
+        "quiet": False,
+        "no-eou": False,
+        "eou-threshold": 0.8,
+        "vad-silence-threshold": 15,
+        "vad-speech-threshold": 0.5,
+        "vad-activity-threshold": 0.3,
+        "no-text-eou": False,
+        "vad-speech-proportion-threshold": 0.2,
+        "vad-analysis-window": 2.0,
+        "vad-consecutive-silence-threshold": 0.8,
+        "websocket-host": None,
+        "websocket-port": 8765
+    }
+
+def build_argparse_from_config(config_path):
+    """
+    Dynamically build argparse parser from config descriptions.
+    This allows --help to auto-populate with descriptions from config.json.
+    """
+    # Load full config to get descriptions
+    try:
+        with open(config_path, 'r') as f:
+            full_config = json.load(f)
+        descriptions = full_config.get("descriptions", {})
+    except Exception:
+        descriptions = {}  # Fallback if config can't be loaded
+    
+    # Load merged config for defaults
+    config = load_config(config_path)
+    
     parser = argparse.ArgumentParser(
-        description="Online ASR with Punctuation, Capitalization, and VAD-based EOU Detection",
+        description="Online ASR with config file support. CLI args override config values.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"""
-Available ASR models:
-{chr(10).join(f"  - {model}" for model in AVAILABLE_ASR_MODELS)}
-
-Available punctuation models:
-{chr(10).join(f"  - {model}" for model in AVAILABLE_PUNCT_MODELS)}
-
-Audio Input Options:
-  - Local microphone: specify device ID (use --list-devices to see options)
-  - Remote audio stream: use --device remote (requires GStreamer RTP stream)
-
-WebSocket Output:
-  - Enable with --websocket-host and --websocket-port
-  - Sends JSON messages with type: "partial", "complete", or "status"
-  - Example: {{"type": "partial", "text": "Hello", "timestamp": 1234567890}}
-
+        epilog="""
 Examples:
-  # Use remote audio stream with WebSocket output
-  python {__file__} --device remote --websocket-host localhost --websocket-port 8765
-
-  # Use local microphone with WebSocket output
-  python {__file__} --device 0 --websocket-host 0.0.0.0 --websocket-port 8765
+  python ws_stt.py --websocket-host 10.0.0.2 --device remote
+  python ws_stt.py --config my_config.json --quiet
         """
     )
     
+    # Add --config arg first
     parser.add_argument(
-        "--asr-model", 
-        default="stt_en_fastconformer_hybrid_large_streaming_multi",
-        choices=AVAILABLE_ASR_MODELS,
-        help="ASR model name to use"
+        "--config",
+        default="config.json",
+        help="Path to JSON config file"
     )
     
-    parser.add_argument(
-        "--punct-model",
-        default="punctuation_en_bert",
-        choices=AVAILABLE_PUNCT_MODELS + [None],
-        help="Punctuation model name (None to disable punctuation)"
-    )
+    # Dynamically add args for each config key using descriptions
+    for key, default_value in config.items():
+        if key in ["mode-selection", "modes", "descriptions"]:
+            continue  # Skip non-setting keys
+        
+        # Determine type based on default value
+        arg_type = type(default_value) if default_value is not None else str
+        if arg_type == bool:
+            # For booleans, use store_true with SUPPRESS to only set if provided
+            parser.add_argument(
+                f"--{key.replace('_', '-')}",
+                action="store_true",
+                default=argparse.SUPPRESS,  # Attribute not set if not provided
+                help=descriptions.get(key, f"Override {key} from config")
+            )
+        else:
+            parser.add_argument(
+                f"--{key.replace('_', '-')}",
+                type=arg_type,
+                default=None,  # None means not provided, so don't override
+                help=descriptions.get(key, f"Override {key} from config")
+            )
     
-    parser.add_argument(
-        "--lookahead", 
-        type=int, 
-        default=480,
-        help="Lookahead size in milliseconds (0, 80, 480, 1040 for multi model)"
-    )
+    return parser
+
+def merge_config_with_args(config, args):
+    """
+    Merge config with CLI args: CLI overrides take precedence if provided.
+    Only overrides non-None CLI values.
+    """
+    merged = config.copy()
+    for key in config:
+        if key in ["mode-selection", "modes", "descriptions"]:
+            continue  # Skip non-setting keys
+        
+        cli_key = key.replace('_', '-')
+        cli_value = getattr(args, cli_key, None)
+        if cli_value is not None:
+            merged[key] = cli_value
+            print(f"[CONFIG] Overriding {key} with CLI value: {cli_value}")
     
-    parser.add_argument(
-        "--decoder", 
-        default="rnnt",
-        choices=["rnnt", "ctc"],
-        help="ASR decoder type to use"
-    )
-    
-    parser.add_argument(
-        "--device", 
-        help="Audio device ID (number for microphone, 'remote' for remote stream, will prompt if not provided)"
-    )
-    
-    parser.add_argument(
-        "--remote-port",
-        type=int,
-        default=5004,
-        help="Port for remote audio stream (default: 5004)"
-    )
-    
-    parser.add_argument(
-        "--chunk-size", 
-        type=int,
-        help="Chunk size in milliseconds (auto-calculated if not provided)"
-    )
-    
-    parser.add_argument(
-        "--show-raw",
-        action="store_true",
-        help="Show both raw and punctuated text"
-    )
-    
-    parser.add_argument(
-        "--list-devices", 
-        action="store_true",
-        help="List available audio devices and exit"
-    )
-    
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Quiet mode: suppress all logs and only show punctuated text output"
-    )
-    
-    parser.add_argument(
-        "--no-eou",
-        action="store_true",
-        help="Disable end-of-utterance detection"
-    )
-    
-    parser.add_argument(
-        "--eou-threshold",
-        type=float,
-        default=0.8,
-        help="Threshold for end-of-utterance detection (0.0-1.0, higher = less sensitive)"
-    )
-    
-    parser.add_argument(
-        "--vad-silence-threshold",
-        type=int,
-        default=15,
-        help="Number of consecutive low-activity frames needed for VAD-based EOU detection"
-    )
-    
-    parser.add_argument(
-        "--vad-speech-threshold",
-        type=float,
-        default=0.5,
-        help="VAD probability threshold for speech detection (0.0-1.0)"
-    )
-    
-    parser.add_argument(
-        "--vad-activity-threshold",
-        type=float,
-        default=0.3,
-        help="Minimum frame activity ratio for speech detection (0.0-1.0)"
-    )
-    
-    parser.add_argument(
-        "--no-text-eou",
-        action="store_true",
-        help="Disable text-based EOU detection, use only frame-based detection"
-    )
-    
-    parser.add_argument(
-        "--vad-speech-proportion-threshold",
-        type=float,
-        default=0.2,  # Changed default from 0.1 to 0.2
-        help="Speech proportion threshold for EOU detection (0.0-1.0, lower = more sensitive)"
-    )
-    
-    parser.add_argument(
-        "--vad-analysis-window",
-        type=float,
-        default=2.0,  # Changed default from 3.0 to 2.0
-        help="Analysis window in seconds for speech proportion calculation"
-    )
-    
-    parser.add_argument(
-        "--vad-consecutive-silence-threshold",
-        type=float,
-        default=0.8,
-        help="Consecutive silence duration in seconds needed for immediate EOU detection"
-    )
-    
-    parser.add_argument(
-        "--websocket-host",
-        default=None,
-        help="WebSocket server host (enables WebSocket output when specified)"
-    )
-    
-    parser.add_argument(
-        "--websocket-port",
-        type=int,
-        default=8765,
-        help="WebSocket server port (default: 8765)"
-    )
-    
+    return merged
+
+def main():
+    # Build dynamic parser from config
+    parser = build_argparse_from_config("config.json")  # Default path; can be overridden later
     args = parser.parse_args()
     
-    # List devices and exit if requested
-    if args.list_devices:
-        list_audio_devices()
-        return
+    # Load config (using the potentially overridden --config path)
+    config = load_config(args.config)
     
-    # Handle device selection
-    device_id = args.device
-    if device_id == 'remote':
-        if not REMOTE_AUDIO_AVAILABLE:
-            print("ERROR: Remote audio stream not available. Please install required dependencies.")
-            return
-        device_id = 'remote'
-    elif device_id is not None:
-        try:
-            device_id = int(device_id)
-        except ValueError:
-            print(f"ERROR: Invalid device ID '{args.device}'. Use 'remote' for remote stream or a number for microphone.")
-            return
+    # Merge config with CLI overrides
+    config = merge_config_with_args(config, args)
     
-    # Set up comprehensive quiet mode before any model loading
-    if args.quiet:
-        # Suppress all possible logging early
-        import warnings
-        warnings.filterwarnings("ignore")
-        
-        # Set environment variables before model loading
-        os.environ['NEMO_DISABLE_PROGRESS_BAR'] = '1'
-        os.environ['TQDM_DISABLE'] = '1'
-        os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-        
-        # Suppress all logging
-        logging.basicConfig(level=logging.CRITICAL)
-        logging.getLogger().setLevel(logging.CRITICAL)
+    # Extract settings from merged config
+    asr_model = config["asr-model"]
+    punct_model = config["punct-model"]
+    lookahead = config["lookahead"]
+    decoder = config["decoder"]
+    device_id = config["device"]
+    remote_port = config["remote-port"]
+    chunk_size_ms = config["chunk-size"]
+    show_raw = config["show-raw"]
+    quiet_mode = config["quiet"]
+    enable_eou = not config["no-eou"]
+    eou_threshold = config["eou-threshold"]
+    vad_silence_threshold = config["vad-silence-threshold"]
+    vad_speech_threshold = config["vad-speech-threshold"]
+    vad_activity_threshold = config["vad-activity-threshold"]
+    no_text_eou = config["no-text-eou"]
+    vad_speech_proportion_threshold = config["vad-speech-proportion-threshold"]
+    vad_analysis_window = config["vad-analysis-window"]
+    vad_consecutive_silence_threshold = config["vad-consecutive-silence-threshold"]
+    websocket_host = config["websocket-host"]
+    websocket_port = config["websocket-port"]
     
     # Initialize WebSocket server if requested
     websocket_server = None
-    if args.websocket_host and WEBSOCKET_AVAILABLE:
+    if websocket_host and WEBSOCKET_AVAILABLE:
         websocket_server = WebSocketServer(
-            host=args.websocket_host,
-            port=args.websocket_port,
-            quiet_mode=args.quiet
+            host=websocket_host,
+            port=websocket_port,
+            quiet_mode=quiet_mode
         )
         
         if websocket_server.start_server():
-            if not args.quiet:
-                print(f"WebSocket server enabled on ws://{args.websocket_host}:{args.websocket_port}")
+            if not quiet_mode:
+                print(f"WebSocket server enabled on ws://{websocket_host}:{websocket_port}")
         else:
             print("ERROR: Failed to start WebSocket server")
             websocket_server = None
-    elif args.websocket_host and not WEBSOCKET_AVAILABLE:
+    elif websocket_host and not WEBSOCKET_AVAILABLE:
         print("ERROR: WebSocket functionality not available. Install with: pip install websockets")
         return
     
     try:
         # Initialize ASR system
-        if not args.quiet:
+        if not quiet_mode:
             print("Initializing Online ASR with VAD-based EOU Detection system...")
             
         asr_system = OnlineASRWithPunctuation(
-            asr_model_name=args.asr_model,
-            punct_model_name=args.punct_model,
-            lookahead_size=args.lookahead,
-            decoder_type=args.decoder,
-            quiet_mode=args.quiet,
-            enable_eou=not args.no_eou,
+            asr_model_name=asr_model,
+            punct_model_name=punct_model,
+            lookahead_size=lookahead,
+            decoder_type=decoder,
+            quiet_mode=quiet_mode,
+            enable_eou=enable_eou,
             websocket_server=websocket_server
         )
         
         # Configure VAD-based EOU detector
         if asr_system.frame_detector and asr_system.frame_detector.vad_model:
-            asr_system.frame_detector.speech_probability_threshold = args.vad_speech_threshold
-            asr_system.frame_detector.speech_proportion_threshold = args.vad_speech_proportion_threshold
-            asr_system.frame_detector.analysis_window_seconds = args.vad_analysis_window
-            
-            # Configure consecutive silence threshold
-            if hasattr(args, 'vad_consecutive_silence_threshold'):
-                asr_system.frame_detector.consecutive_silence_threshold = int(
-                    args.vad_consecutive_silence_threshold / asr_system.frame_detector.vad_frame_duration
-                )
-            
+            asr_system.frame_detector.speech_probability_threshold = vad_speech_threshold
+            asr_system.frame_detector.speech_proportion_threshold = vad_speech_proportion_threshold
+            asr_system.frame_detector.analysis_window_seconds = vad_analysis_window
+            asr_system.frame_detector.consecutive_silence_threshold = int(
+                vad_consecutive_silence_threshold / asr_system.frame_detector.vad_frame_duration
+            )
             # Recalculate frames per analysis window
             asr_system.frame_detector.frames_per_analysis_window = int(
-                args.vad_analysis_window / asr_system.frame_detector.vad_frame_duration
+                vad_analysis_window / asr_system.frame_detector.vad_frame_duration
             )
             asr_system.frame_detector.speech_frame_history = deque(
                 maxlen=asr_system.frame_detector.frames_per_analysis_window
             )
             
-            if not args.quiet:
+            if not quiet_mode:
                 print(f"VAD-based EOU configured:")
-                print(f"  Analysis window: {args.vad_analysis_window}s")
-                print(f"  Speech probability threshold: {args.vad_speech_threshold}")
-                print(f"  Speech proportion threshold: {args.vad_speech_proportion_threshold}")
-                print(f"  Consecutive silence threshold: {args.vad_consecutive_silence_threshold if hasattr(args, 'vad_consecutive_silence_threshold') else 0.8}s")
+                print(f"  Analysis window: {vad_analysis_window}s")
+                print(f"  Speech probability threshold: {vad_speech_threshold}")
+                print(f"  Speech proportion threshold: {vad_speech_proportion_threshold}")
+                print(f"  Consecutive silence threshold: {vad_consecutive_silence_threshold}s")
                 print(f"  Frames per window: {asr_system.frame_detector.frames_per_analysis_window}")
         
         # Disable text-based EOU if requested
-        if args.no_text_eou:
+        if no_text_eou:
             asr_system.eou_detector = None
-            if not args.quiet:
+            if not quiet_mode:
                 print("Text-based EOU detection disabled")
         
         # Update EOU threshold if specified
-        if asr_system.eou_detector and hasattr(args, 'eou_threshold'):
-            asr_system.eou_detector.threshold = args.eou_threshold
-            if not args.quiet:
-                print(f"EOU threshold set to: {args.eou_threshold}")
-        
-        if not args.quiet:
+        if asr_system.eou_detector and not no_text_eou:
+            asr_system.eou_detector.threshold = eou_threshold
+    
+        if not quiet_mode:
             print("\nASR system ready!")
-            print(f"ASR Model: {args.asr_model}")
-            print(f"Punctuation Model: {args.punct_model or 'None'}")
-            print(f"EOU Detection: {'Enabled' if not args.no_eou else 'Disabled'}")
-            print(f"Lookahead: {args.lookahead}ms")
-            print(f"Decoder: {args.decoder}")
+            print(f"ASR Model: {asr_model}")
+            print(f"Punctuation Model: {punct_model or 'None'}")
+            print(f"EOU Detection: {'Enabled' if not no_text_eou else 'Disabled'}")
+            print(f"Lookahead: {lookahead}ms")
+            print(f"Decoder: {decoder}")
             if device_id == 'remote':
-                print(f"Audio Input: Remote stream (port {args.remote_port})")
+                print(f"Audio Input: Remote stream (port {remote_port})")
             else:
                 print(f"Audio Input: {'Auto-select microphone' if device_id is None else f'Device {device_id}'}")
             if websocket_server:
-                print(f"WebSocket Output: ws://{args.websocket_host}:{args.websocket_port}")
+                print(f"WebSocket Output: ws://{websocket_host}:{websocket_port}")
         
-        # Run streaming ASR
+        # Run streaming ASR with config values
         run_streaming_asr_with_punct(
             asr_system=asr_system,
             device_id=device_id,
-            chunk_size_ms=args.chunk_size,
-            show_raw=args.show_raw,
-            quiet_mode=args.quiet,
-            remote_audio_port=args.remote_port
+            chunk_size_ms=chunk_size_ms,
+            show_raw=show_raw,
+            quiet_mode=quiet_mode,
+            remote_audio_port=remote_port
         )
         
     except KeyboardInterrupt:
