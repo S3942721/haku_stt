@@ -62,7 +62,8 @@
       "eou-threshold": 0.9
     },
     "reliable": {
-      "enable-text-eou": false
+      "enable-text-eou": false,
+      "punct-model": "punctuation_en_distilbert"
     }
   }
 }

@@ -1841,6 +1841,7 @@ def build_argparse_from_config(config_path):
 Examples:
   python ws_stt.py --websocket-host 10.0.0.2 --device remote
   python ws_stt.py --config my_config.json --quiet
+  python ws_stt.py --mode-selection fast
         """
     )
     
@@ -1849,6 +1850,14 @@ Examples:
         "--config",
         default="config.json",
         help="Path to JSON config file"
+    )
+    
+    # Add --mode-selection arg
+    parser.add_argument(
+        "--mode-selection",
+        type=str,
+        default=None,
+        help="Mode selection from config.json (e.g., 'default', 'fast', 'slow', 'reliable')"
     )
     
     # Dynamically add args for each config key using descriptions
@@ -1901,6 +1910,11 @@ def main():
     
     # Load config (using the potentially overridden --config path)
     config = load_config(args.config)
+    
+    # Override mode-selection if provided via CLI
+    if args.mode_selection is not None:
+        config["mode-selection"] = args.mode_selection
+        print(f"[CONFIG] Overriding mode-selection with CLI value: {args.mode_selection}")
     
     # Merge config with CLI overrides
     config = merge_config_with_args(config, args)
