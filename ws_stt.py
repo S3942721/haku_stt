@@ -133,14 +133,20 @@ class EndOfUtteranceDetector:
         if not self.tokenizer or not self.session or not text.strip():
             return False
         
-        # Check minimum length requirement
-        word_count = len(text.strip().split())
+        # Remove final punctuation before EOU analysis
+        cleaned_text = text.strip()
+        if cleaned_text and cleaned_text[-1] in '.!?':
+            cleaned_text = cleaned_text[:-1].strip()
+        
+        # Check minimum length requirement on cleaned text
+        word_count = len(cleaned_text.split())
         if word_count < self.min_words_for_eou:
+            self.logger.verbose(f"Text too short for EOU analysis: {word_count} < {self.min_words_for_eou} words")
             return False
         
         try:
-            # Prepare input in the format expected by TurnSense
-            formatted_text = f"<|user|> {text.strip()} <|im_end|>"
+            # Prepare input in the format expected by TurnSense using cleaned text
+            formatted_text = f"<|user|> {cleaned_text} <|im_end|>"
             
             # Tokenize
             inputs = self.tokenizer(
@@ -174,9 +180,9 @@ class EndOfUtteranceDetector:
             # Require multiple consecutive confirmations
             confirmation_count = sum(self.recent_detections[-self.confirmation_needed:])
             is_eou = (confirmation_count >= self.confirmation_needed and 
-                     len(self.recent_detections) >= self.confirmation_needed)
+                    len(self.recent_detections) >= self.confirmation_needed)
             
-            # Additional checks for natural sentence endings
+            # Additional checks for natural sentence endings (using original text for context)
             text_lower = text.strip().lower()
             has_natural_ending = any(text_lower.endswith(ending) for ending in [
                 '.', '?', '!', '. thank you', '. thanks', 'that\'s it', 'that is it'
@@ -185,33 +191,67 @@ class EndOfUtteranceDetector:
             # Only trigger EOU if we have both model confidence AND natural ending indicators
             final_eou = is_eou and (has_natural_ending or eou_probability > 0.9)
             
-            if not self.quiet_mode and final_eou:
-                print(f"[EOU] Detected end of utterance (confidence: {eou_probability:.3f}, words: {word_count}, confirmations: {confirmation_count})")
-            elif not self.quiet_mode and is_above_threshold:
-                print(f"[EOU] Potential EOU detected but not confirmed (confidence: {eou_probability:.3f}, words: {word_count})")
+            # Logging based on level
+            self.logger.verbose(f"EOU analysis - probability: {eou_probability:.3f}, threshold: {self.threshold}, "
+                              f"above_threshold: {is_above_threshold}, confirmations: {confirmation_count}/{self.confirmation_needed}")
             
-            print(f"Current EOU probability: {eou_probability}, recent detections: {self.recent_detections}")
-            
-            # Reset detection history if we actually trigger EOU
             if final_eou:
+                self.logger.debug(f"TEXT-EOU TRIGGERED - confidence: {eou_probability:.3f}, words: {word_count}, "
+                                f"confirmations: {confirmation_count}, natural_ending: {has_natural_ending}")
+                self.logger.info(f"End of utterance detected via text analysis")
+                # Reset detection history
                 self.recent_detections = []
+            elif is_above_threshold:
+                self.logger.verbose(f"Potential EOU detected but not confirmed - confidence: {eou_probability:.3f}")
             
             return final_eou
             
         except Exception as e:
-            if not self.quiet_mode:
-                print(f"EOU detection error: {e}")
+            self.logger.error(f"EOU detection error: {e}")
             return False
 
-class FrameLevelSpeechDetector:
-    def __init__(self, quiet_mode=False):
-        """Analyze frame-level speech activity using NeMo VAD model"""
-        self.quiet_mode = quiet_mode
+class FrameLevelSpeechDetector(LoggerMixin):
+    def __init__(self, vad_model_type="nvidia", config=None, log_config=None):
+        """Analyze frame-level speech activity using configurable VAD model"""
+        # Initialize logging first
+        if log_config is None:
+            log_config = {"log_level": "debug"}
+        self.__init_logger__("VAD", **log_config)
+        
+        self.vad_model_type = vad_model_type.lower()
         
         # Frame-level analysis parameters
-        self.vad_frame_duration = 0.02  # 20ms per VAD frame
-        self.analysis_window_seconds = 2.0  # Analyze last 2 seconds (reduced from 3s)
-        self.frames_per_analysis_window = int(self.analysis_window_seconds / self.vad_frame_duration)  # 100 frames for 2 seconds
+        if self.vad_model_type == "silero":
+            # Silero VAD uses 32ms frames (512 samples at 16kHz)
+            self.vad_frame_duration = 0.032  # 32ms per VAD frame for Silero
+            self.window_size_samples = 512  # Fixed for 16kHz
+        else:
+            # NeMo VAD uses 20ms frames
+            self.vad_frame_duration = 0.02  # 20ms per VAD frame for NeMo
+        
+        # Apply configuration parameters if provided
+        if config:
+            self.analysis_window_seconds = config.get("vad-analysis-window", 2.0)
+            self.speech_proportion_threshold = config.get("vad-speech-proportion-threshold", 0.15)
+            self.speech_probability_threshold = config.get("vad-speech-threshold", 0.25)
+            self.consecutive_silence_threshold_seconds = config.get("vad-consecutive-silence-threshold", 0.8)
+            self.min_frames_for_eou_seconds = config.get("vad-min-frames-for-eou", 0.5)
+            self.lookback_seconds = config.get("vad-lookback-seconds", 1.5)
+            self.recent_speech_threshold = config.get("vad-recent-speech-threshold", 0.10)
+        else:
+            # Default values
+            self.analysis_window_seconds = 2.0
+            self.speech_proportion_threshold = 0.15
+            self.speech_probability_threshold = 0.25
+            self.consecutive_silence_threshold_seconds = 0.8
+            self.min_frames_for_eou_seconds = 0.5
+            self.lookback_seconds = 1.5
+            self.recent_speech_threshold = 0.10
+            
+        # Calculate frame-based values from time-based config
+        self.frames_per_analysis_window = int(self.analysis_window_seconds / self.vad_frame_duration)
+        self.min_frames_for_eou = int(self.min_frames_for_eou_seconds / self.vad_frame_duration)
+        self.consecutive_silence_threshold = int(self.consecutive_silence_threshold_seconds / self.vad_frame_duration)
         
         # Rolling window to store frame-level speech detection results
         self.speech_frame_history = deque(maxlen=self.frames_per_analysis_window)
@@ -514,6 +554,9 @@ class WebSocketServer:
         self.running = False
         # Add command queue for processing control commands
         self.command_queue = queue.Queue()
+        # Add state management
+        self.current_state = 'running'
+        self.start_time = time.time()
         
     async def register_client(self, websocket):
         """Register a new WebSocket client"""
@@ -562,7 +605,7 @@ class WebSocketServer:
                 print(f"WebSocket client disconnected")
     
     async def handle_command(self, command, websocket):
-        """Handle incoming commands from WebSocket clients"""
+        """Enhanced command handler with state management support"""
         if not isinstance(command, dict) or "type" not in command:
             await websocket.send(json.dumps({
                 "type": "error",
@@ -575,15 +618,18 @@ class WebSocketServer:
         
         if command_type == "control":
             action = command.get("action")
-            if action in ["pause", "resume", "purge", "reset"]:
+            
+            # Enhanced control actions
+            if action in ["pause", "resume", "purge", "reset", "stop", "ping", "get_state"]:
                 # Add command to queue for main thread processing
                 self.command_queue.put({
                     "action": action,
                     "timestamp": time.time(),
-                    "client": websocket.remote_address if hasattr(websocket, 'remote_address') else "unknown"
+                    "client": websocket.remote_address if hasattr(websocket, 'remote_address') else "unknown",
+                    "healthCheck": command.get("healthCheck", False)
                 })
                 
-                # Send acknowledgment
+                # Send immediate acknowledgment
                 response = {
                     "type": "command_ack",
                     "action": action,
@@ -592,8 +638,33 @@ class WebSocketServer:
                 }
                 await websocket.send(json.dumps(response))
                 
+                # Handle immediate responses for certain commands
+                if action == "ping":
+                    # Send pong response for health checks
+                    pong_response = {
+                        "type": "pong" if command.get("healthCheck") else "status",
+                        "status": getattr(self, 'current_state', 'running'),
+                        "healthCheck": command.get("healthCheck", False),
+                        "timestamp": time.time()
+                    }
+                    await websocket.send(json.dumps(pong_response))
+                
+                elif action == "get_state":
+                    # Send current state immediately
+                    state_response = {
+                        "type": "status",
+                        "status": getattr(self, 'current_state', 'running'),
+                        "details": {
+                            "uptime": time.time() - getattr(self, 'start_time', time.time()),
+                            "clients_connected": len(self.clients)
+                        },
+                        "timestamp": time.time()
+                    }
+                    await websocket.send(json.dumps(state_response))
+                
                 if not self.quiet_mode:
                     print(f"WebSocket command received: {action}")
+                    
             else:
                 await websocket.send(json.dumps({
                     "type": "error",
@@ -702,6 +773,24 @@ class WebSocketServer:
             if not self.quiet_mode:
                 print(f"Error sending status update: {e}")
     
+    async def send_state_update(self, state, details=None):
+        """Send state update to all connected clients"""
+        self.current_state = state
+        message = {
+            "type": "status",
+            "status": state,
+            "details": details or {},
+            "timestamp": time.time()
+        }
+        await self.broadcast_message(message)
+        
+        if not self.quiet_mode:
+            print(f"State updated to: {state}")
+    
+    def get_current_state(self):
+        """Get current processing state"""
+        return getattr(self, 'current_state', 'running')
+    
     def start_server(self):
         """Start WebSocket server in a separate thread"""
         def run_server():
@@ -796,9 +885,18 @@ class OnlineASRWithPunctuation:
         self.enable_eou = enable_eou
         self.websocket_server = websocket_server
         
-        # Add processing control state
+        # Add enhanced state management
+        self.current_state = 'running'
         self.is_paused = False
-        self.last_control_check = time.time()
+        self.is_stopped = False
+        self.last_command_check = time.time()
+        self.command_check_interval = 0.1  # Check for commands every 100ms
+        
+        # Store start time for uptime reporting
+        self.start_time = time.time()
+        if websocket_server:
+            websocket_server.start_time = self.start_time
+            websocket_server.current_state = self.current_state
         
         # Comprehensive logging suppression for quiet mode
         if quiet_mode:
@@ -1137,11 +1235,8 @@ class OnlineASRWithPunctuation:
         Returns:
             tuple: (raw_text, punctuated_text, is_eou, complete_utterance)
         """
-        # Check for WebSocket commands
-        self._check_websocket_commands()
-        
-        # If paused, return empty results without processing
-        if self.is_paused:
+        # Check if processing should continue (includes command checking)
+        if not self.should_process_audio():
             return "", "", False, None
         
         try:
@@ -1295,61 +1390,103 @@ class OnlineASRWithPunctuation:
                 traceback.print_exc()
             return "", "", False, None
     
-    def _check_websocket_commands(self):
-        """Check for and process WebSocket commands"""
+    def check_and_process_commands(self):
+        """Check for pending WebSocket commands and process them"""
         if not self.websocket_server:
             return
         
-        # Only check commands periodically to avoid performance impact
         current_time = time.time()
-        if current_time - self.last_control_check < 0.1:  # Check every 100ms
+        if current_time - self.last_command_check < self.command_check_interval:
             return
         
-        self.last_control_check = current_time
+        self.last_command_check = current_time
         
+        # Get all pending commands
         commands = self.websocket_server.get_pending_commands()
+        
         for command in commands:
             action = command.get("action")
+            if not self.quiet_mode:
+                print(f"Processing command: {action}")
             
             if action == "pause":
-                if not self.is_paused:
-                    self.is_paused = True
-                    # Purge current utterance and reset when pausing
-                    self._purge_and_reset()
-                    if not self.quiet_mode:
-                        print("[CONTROL] Processing paused and utterance purged")
-                    self.websocket_server.send_status_update(
-                        "paused", 
-                        {"action": "pause", "purged": True, "timestamp": time.time()}
-                    )
-                    
-            elif action == "resume":
-                if self.is_paused:
-                    self.is_paused = False
-                    if not self.quiet_mode:
-                        print("[CONTROL] Processing resumed")
-                    self.websocket_server.send_status_update(
-                        "resumed",
-                        {"action": "resume", "timestamp": time.time()}
-                    )
-                    
-            elif action == "purge":
-                self._purge_and_reset()
-                if not self.quiet_mode:
-                    print("[CONTROL] Current utterance purged and ASR reset")
-                self.websocket_server.send_status_update(
-                    "purged",
-                    {"action": "purge", "timestamp": time.time()}
-                )
+                self.is_paused = True
+                self.current_state = 'paused'
+                self._purge_and_reset()  # Purge when pausing
+                if self.websocket_server and self.websocket_server.loop:
+                    # Use asyncio to send state update
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self.websocket_server.send_state_update('paused', {
+                                'action': 'pause',
+                                'purged': True,
+                                'timestamp': time.time()
+                            }),
+                            self.websocket_server.loop
+                        )
+                    except Exception as e:
+                        if not self.quiet_mode:
+                            print(f"Error sending pause state update: {e}")
                 
-            elif action == "reset":
+            elif action == "resume":
+                self.is_paused = False
+                self.current_state = 'running'
+                if self.websocket_server and self.websocket_server.loop:
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self.websocket_server.send_state_update('running'),
+                            self.websocket_server.loop
+                        )
+                    except Exception as e:
+                        if not self.quiet_mode:
+                            print(f"Error sending resume state update: {e}")
+                
+            elif action == "stop":
+                self.is_stopped = True
+                self.current_state = 'stopped'
+                if self.websocket_server and self.websocket_server.loop:
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self.websocket_server.send_state_update('stopped'),
+                            self.websocket_server.loop
+                        )
+                    except Exception as e:
+                        if not self.quiet_mode:
+                            print(f"Error sending stop state update: {e}")
+                
+            elif action == "purge" or action == "reset":
+                # Clear internal buffers
                 self._purge_and_reset()
-                if not self.quiet_mode:
-                    print("[CONTROL] Complete system reset performed")
-                self.websocket_server.send_status_update(
-                    "reset_complete",
-                    {"action": "reset", "timestamp": time.time()}
-                )
+                
+                # Reset state
+                self.is_paused = False
+                self.is_stopped = False
+                self.current_state = 'running'
+                
+                if self.websocket_server and self.websocket_server.loop:
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self.websocket_server.send_state_update('reset', {
+                                'conversation_reset': True,
+                                'timestamp': time.time()
+                            }),
+                            self.websocket_server.loop
+                        )
+                    except Exception as e:
+                        if not self.quiet_mode:
+                            print(f"Error sending reset state update: {e}")
+
+    def should_process_audio(self):
+        """Check if audio processing should continue"""
+        # Always check for commands first
+        self.check_and_process_commands()
+        
+        # Return processing state
+        return not (self.is_paused or self.is_stopped)
+
+    def _check_websocket_commands(self):
+        """Legacy method - now calls enhanced check_and_process_commands"""
+        self.check_and_process_commands()
     
     def _purge_and_reset(self):
         """Purge current utterance and reset ASR and EOU detection"""
@@ -1468,11 +1605,9 @@ def run_streaming_asr_with_remote_audio(asr_system, remote_port, chunk_size_ms, 
         # Main processing loop - modeled after PyAudio callback
         while True:
             try:
-                # Check for WebSocket commands even when no audio
-                asr_system._check_websocket_commands()
-                
-                # If paused, skip audio processing but continue checking commands
-                if asr_system.is_paused:
+                # Check if processing should continue (includes command checking)
+                if not asr_system.should_process_audio():
+                    # If paused/stopped, skip audio processing but continue checking commands
                     time.sleep(0.1)
                     continue
                 
@@ -1663,11 +1798,8 @@ def run_streaming_asr_with_microphone(asr_system, device_id, chunk_size_ms, show
         def stream_callback(in_data, frame_count, time_info, status):
             nonlocal last_raw, last_punct
             
-            # Check for WebSocket commands
-            asr_system._check_websocket_commands()
-            
-            # If paused, return silence without processing
-            if asr_system.is_paused:
+            # Check if processing should continue (includes command checking)
+            if not asr_system.should_process_audio():
                 return (in_data, pa.paContinue)
             
             if status and not quiet_mode:
@@ -2022,6 +2154,16 @@ def main():
                 print(f"Audio Input: {'Auto-select microphone' if device_id is None else f'Device {device_id}'}")
             if websocket_server:
                 print(f"WebSocket Output: ws://{websocket_host}:{websocket_port}")
+        
+        # Send initial state via WebSocket
+        if websocket_server:
+            websocket_server.send_status_update("running", {
+                "asr_model": asr_model,
+                "punct_model": punct_model,
+                "eou_enabled": enable_eou,
+                "device_type": "remote" if device_id == 'remote' else "microphone",
+                "initialized": True
+            })
     
         # Run streaming ASR with config values
         run_streaming_asr_with_punct(
@@ -2044,7 +2186,8 @@ def main():
     finally:
         # Clean up WebSocket server
         if websocket_server:
-            websocket_server.send_status_update("stopped")
+            websocket_server.send_status_update("stopped", {"reason": "shutdown"})
+            time.sleep(0.5)  # Give time for final message to send
             websocket_server.stop_server()
 
 if __name__ == "__main__":
