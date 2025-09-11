@@ -108,10 +108,10 @@
     "fast-eou": {
       "vad-model": "silero",
       "enable-text-eou": true,
-      "vad-speech-threshold": 0.15,
+      "vad-speech-threshold": 0.20,
       "vad-speech-proportion-threshold": 0.1,
       "vad-analysis-window": 2.0,
-      "vad-consecutive-silence-threshold": 0.8,
+      "vad-consecutive-silence-threshold": 0.6,
       "vad-min-frames-for-eou": 0.3,
       "vad-recent-speech-lookback-seconds": 5.0,
       "vad-recent-speech-threshold": 0.1,

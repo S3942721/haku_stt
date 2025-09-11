@@ -199,7 +199,7 @@ class UnifiedEOUDetector(LoggerMixin):
             "eou-weights": {
                 "vad": 2,      # VAD-based detection weight
                 "text": 1,     # Text-based detection weight  
-                "silence": 1,  # Pure silence detection weight
+                "silence": 0,  # Pure silence detection weight
                 "buffer_vad": 1 # Text buffer + low VAD detection weight
             },
             "eou-min-words": 4,
@@ -320,8 +320,20 @@ class UnifiedEOUDetector(LoggerMixin):
                 # Higher consecutive silence = higher EOU confidence
                 silence_confidence = min(1.0, consecutive_silence / silence_threshold)
                 
-                # Take the maximum of both confidence measures
-                vad_score = max(proportion_confidence, silence_confidence)
+                # CONSECUTIVE SILENCE OVERRIDE: If we have strong consecutive silence, boost confidence significantly
+                if consecutive_silence >= silence_threshold:
+                    # Strong consecutive silence detected - give very high confidence
+                    consecutive_silence_boost = min(1.0, consecutive_silence / silence_threshold)
+                    # Apply exponential boost for consecutive silence - this should dominate
+                    boosted_silence_confidence = min(1.0, consecutive_silence_boost ** 0.5)  # Square root for gentler curve
+                    vad_score = max(boosted_silence_confidence, silence_confidence, proportion_confidence)
+                    
+                    # Additional boost if consecutive silence is much higher than threshold
+                    if consecutive_silence >= silence_threshold * 1.5:
+                        vad_score = min(1.0, vad_score * 2)  # 200% boost for very long silence
+                else:
+                    # Normal calculation when consecutive silence hasn't reached threshold
+                    vad_score = max(proportion_confidence, silence_confidence)
                 
                 # Clamp to valid range
                 vad_score = max(0.0, min(1.0, vad_score))
@@ -423,8 +435,29 @@ class UnifiedEOUDetector(LoggerMixin):
         # Use raw confidence directly - no smoothing needed since individual detectors already use historical data
         final_confidence = weighted_confidence
         
+        # CONSECUTIVE SILENCE OVERRIDE: Check if VAD has detected very strong consecutive silence
+        consecutive_silence_override = False
+        if self.vad_detector and method_scores.get("vad", 0) >= 1.0:
+            # Check if this is due to strong consecutive silence
+            consecutive_silence = getattr(self.vad_detector, 'consecutive_silence_frames', 0)
+            silence_threshold = getattr(self.vad_detector, 'consecutive_silence_threshold', 25)
+            
+            if consecutive_silence >= silence_threshold * 1.5:  # 1.5x the threshold
+                consecutive_silence_override = True
+                # Boost final confidence significantly for very long silence
+                silence_boost = min(0.3, (consecutive_silence - silence_threshold) * 0.01)
+                final_confidence = min(1.0, final_confidence + silence_boost)
+                
+                self.logger.debug(f"Consecutive silence override: {consecutive_silence} frames >= {silence_threshold * 1.5:.0f}, "
+                                f"boosting confidence by {silence_boost:.3f} to {final_confidence:.3f}")
+        
         # Determine if EOU should trigger
-        is_eou = final_confidence >= self.config["eou-threshold"]
+        # Lower threshold slightly if we have consecutive silence override
+        effective_threshold = self.config["eou-threshold"]
+        if consecutive_silence_override:
+            effective_threshold = max(0.5, self.config["eou-threshold"] * 0.9)  # 10% lower threshold
+        
+        is_eou = final_confidence >= effective_threshold
         
         # Always log the final decision at debug level for analysis
         self.logger.debug(f"Unified EOU decision: confidence={final_confidence:.3f}, "
