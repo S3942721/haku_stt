@@ -1392,13 +1392,15 @@ class WebSocketServer(LoggerMixin):
                     await websocket.send(json.dumps(pong_response))
                 
                 elif action == "get_state":
-                    # Send current state immediately
+                    # Send current state immediately - always use current_state from ASR system
+                    current_actual_state = getattr(self, 'current_state', 'running')
                     state_response = {
                         "type": "status",
-                        "status": getattr(self, 'current_state', 'running'),
+                        "status": current_actual_state,
                         "details": {
                             "uptime": time.time() - getattr(self, 'start_time', time.time()),
-                            "clients_connected": len(self.clients)
+                            "clients_connected": len(self.clients),
+                            "is_processing": current_actual_state == 'running'
                         },
                         "timestamp": time.time()
                     }
@@ -1765,7 +1767,7 @@ class OnlineASRWithPunctuation(LoggerMixin):
         self.preprocessor = EncDecCTCModelBPE.from_config_dict(cfg.preprocessor)
         self.preprocessor.to(self.asr_model.device)
         
-    def _reset_streaming_state(self, reset_conversation=True):
+    def _reset_streaming_state(self, reset_conversation=True, send_websocket_updates=True):
         """Reset streaming state for new session - complete ASR reset"""
         # Initialize cache states - complete reset
         self.cache_last_channel, self.cache_last_time, self.cache_last_channel_len = \
@@ -1794,12 +1796,35 @@ class OnlineASRWithPunctuation(LoggerMixin):
         # Reset current utterance accumulation
         self.current_utterance = ""
         
-        # Send reset notification via WebSocket
-        if self.websocket_server:
-            self.websocket_server.send_status_update(
-                "reset",
-                {"conversation_reset": reset_conversation, "timestamp": time.time()}
-            )
+        # Send reset notification via WebSocket with follow-up running status
+        if send_websocket_updates and self.websocket_server and self.websocket_server.loop:
+            try:
+                # Send reset status ONCE
+                asyncio.run_coroutine_threadsafe(
+                    self.websocket_server.send_state_update('reset', {
+                        "conversation_reset": reset_conversation, 
+                        "timestamp": time.time()
+                    }),
+                    self.websocket_server.loop
+                )
+                
+                # Schedule follow-up "running" state after brief delay
+                async def send_running_after_reset():
+                    await asyncio.sleep(0.1)  # 100ms delay
+                    # Update WebSocket server state to running
+                    self.websocket_server.current_state = 'running'
+                    await self.websocket_server.send_state_update('running', {
+                        'auto_reset_complete': True,
+                        'timestamp': time.time()
+                    })
+                
+                asyncio.run_coroutine_threadsafe(
+                    send_running_after_reset(),
+                    self.websocket_server.loop
+                )
+                
+            except Exception as e:
+                self.logger.error(f"Error sending reset state updates: {e}")
         
         self.logger.debug("Complete ASR streaming state reset")
     
@@ -2088,11 +2113,12 @@ class OnlineASRWithPunctuation(LoggerMixin):
                     self.logger.critical(f"COMPLETE UTTERANCE: {complete_utterance}")
                     
                     eou_type = "VAD" if is_frame_eou else "Text"
-                    self.logger.debug(f"{eou_type}-EOU: End of utterance confirmed with recent speech or accumulated text, performing complete ASR reset")
+                    self.logger.debug(f"{eou_type}-EOU: End of utterance confirmed with recent speech or accumulated text, performing internal ASR reset")
                     
-                    # COMPLETE ASR RESET - Reset conversation buffer and streaming state entirely
+                    # INTERNAL ASR RESET - Reset conversation buffer and streaming state silently
+                    # This is just internal cleanup, no status messages needed for clients
                     self.conversation_buffer = []
-                    self._reset_streaming_state(reset_conversation=False)
+                    self._reset_streaming_state(reset_conversation=False, send_websocket_updates=False)
                 else:
                     self.logger.verbose(f"EOU detected but no recent speech activity or accumulated text - skipping reset")
                     # Don't reset, just continue processing
@@ -2127,8 +2153,25 @@ class OnlineASRWithPunctuation(LoggerMixin):
                 self.is_paused = True
                 self.current_state = 'paused'
                 self.logger.info("Received pause command - Pausing audio processing")
-                self._purge_and_reset()  # Purge when pausing
+                
+                # Manual purge and reset without WebSocket updates
+                self.conversation_buffer = []
+                self.current_utterance = ""
+                self._reset_streaming_state(reset_conversation=True, send_websocket_updates=False)
+                
+                # Reset frame detector state
+                if self.frame_detector:
+                    self.frame_detector.speech_frame_history.clear()
+                    self.frame_detector.reset_silence_tracking()
+                
+                # Reset unified EOU detector state
+                if self.unified_eou_detector:
+                    self.unified_eou_detector.reset()
+                
+                # Send paused status
                 if self.websocket_server and self.websocket_server.loop:
+                    # Update WebSocket server state
+                    self.websocket_server.current_state = self.current_state
                     # Use asyncio to send state update
                     try:
                         asyncio.run_coroutine_threadsafe(
@@ -2147,9 +2190,14 @@ class OnlineASRWithPunctuation(LoggerMixin):
                 self.current_state = 'running'
                 self.logger.info("Received resume command - Resuming audio processing")
                 if self.websocket_server and self.websocket_server.loop:
+                    # Update WebSocket server state
+                    self.websocket_server.current_state = self.current_state
                     try:
                         asyncio.run_coroutine_threadsafe(
-                            self.websocket_server.send_state_update('running'),
+                            self.websocket_server.send_state_update('running', {
+                                'action': 'resume',
+                                'timestamp': time.time()
+                            }),
                             self.websocket_server.loop
                         )
                     except Exception as e:
@@ -2160,35 +2208,30 @@ class OnlineASRWithPunctuation(LoggerMixin):
                 self.current_state = 'stopped'
                 self.logger.info("Received stop command - Stopping audio processing")
                 if self.websocket_server and self.websocket_server.loop:
+                    # Update WebSocket server state
+                    self.websocket_server.current_state = self.current_state
                     try:
                         asyncio.run_coroutine_threadsafe(
-                            self.websocket_server.send_state_update('stopped'),
+                            self.websocket_server.send_state_update('stopped', {
+                                'action': 'stop',
+                                'timestamp': time.time()
+                            }),
                             self.websocket_server.loop
                         )
                     except Exception as e:
                         self.logger.error(f"Error sending stop state update: {e}")
                 
             elif action == "purge" or action == "reset":
-                # Clear internal buffers
+                # Clear internal buffers first - this will send reset + running messages
                 self._purge_and_reset()
                 
-                # Reset state
+                # Update state flags
                 self.is_paused = False
                 self.is_stopped = False
-                self.current_state = 'running'
+                self.current_state = 'running'  # Set to running immediately
                 self.logger.info(f"Received {action} command - Purging buffers and resetting ASR state")
                 
-                if self.websocket_server and self.websocket_server.loop:
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            self.websocket_server.send_state_update('reset', {
-                                'conversation_reset': True,
-                                'timestamp': time.time()
-                            }),
-                            self.websocket_server.loop
-                        )
-                    except Exception as e:
-                        self.logger.error(f"Error sending reset state update: {e}")
+                # No need to send additional reset messages since _purge_and_reset() handles it
 
     def should_process_audio(self):
         """Check if audio processing should continue"""
@@ -2207,7 +2250,7 @@ class OnlineASRWithPunctuation(LoggerMixin):
         # Reset conversation buffer and streaming state
         self.conversation_buffer = []
         self.current_utterance = ""
-        self._reset_streaming_state(reset_conversation=True)
+        self._reset_streaming_state(reset_conversation=True, send_websocket_updates=True)
         
         # Reset frame detector state
         if self.frame_detector:
@@ -3034,13 +3077,33 @@ def main():
         
         # Send initial state via WebSocket
         if websocket_server:
-            websocket_server.send_status_update("running", {
+            # Send "started" status ONCE during initialization
+            websocket_server.send_status_update("started", {
                 "asr_model": asr_model,
                 "punct_model": punct_model,
                 "eou_enabled": enable_eou,
                 "device_type": "remote" if device_id == 'remote' else "microphone",
                 "initialized": True
             })
+            
+            # Schedule transition to "running" state after initialization
+            async def transition_to_running():
+                await asyncio.sleep(0.5)  # Give time for started message to be received
+                # Update WebSocket server state to running
+                websocket_server.current_state = 'running'
+                await websocket_server.send_state_update('running', {
+                    'initialization_complete': True,
+                    'timestamp': time.time()
+                })
+            
+            if websocket_server.loop:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        transition_to_running(),
+                        websocket_server.loop
+                    )
+                except Exception as e:
+                    main_logger.error(f"Error transitioning to running state: {e}")
     
         # Run streaming ASR with config values
         run_streaming_asr_with_punct(
