@@ -45,7 +45,7 @@
       "vad-recent-speech-threshold": 0.10
     },
     "silero": {
-      "vad-speech-threshold": 0.2, 
+      "vad-speech-threshold": 0.7,
       "vad-speech-proportion-threshold": 0.2,
       "vad-analysis-window": 4.0,
       "vad-consecutive-silence-threshold": 1.5,
@@ -72,7 +72,7 @@
       "vad-model": "nvidia",
       "vad-silence-threshold": 15,
       "vad-activity-threshold": 0.3,
-      "websocket-host": "10.0.0.2",
+      "websocket-host": "0.0.0.0",
       "websocket-port": 8765,
       "websocket-ping-interval": 20,
       "websocket-ping-timeout": 10,
@@ -108,7 +108,6 @@
     "fast-eou": {
       "vad-model": "silero",
       "enable-text-eou": true,
-      "vad-speech-threshold": 0.20,
       "vad-speech-proportion-threshold": 0.1,
       "vad-analysis-window": 2.0,
       "vad-consecutive-silence-threshold": 0.6,
