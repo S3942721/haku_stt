@@ -55,7 +55,7 @@ class FrameSpeechTester:
             "vad-analysis-window": self.config.get("vad-analysis-window", 2.5 if self.vad_model_type == "silero" else 2.0),
             "vad-consecutive-silence-threshold": self.config.get("vad-consecutive-silence-threshold", 1.0 if self.vad_model_type == "silero" else 0.8),
             "vad-min-frames-for-eou": self.config.get("vad-min-frames-for-eou", 0.64 if self.vad_model_type == "silero" else 0.5),
-            "vad-lookback-seconds": self.config.get("vad-lookback-seconds", 2.0 if self.vad_model_type == "silero" else 1.5),
+            "vad-recent-speech-lookback-seconds": self.config.get("vad-recent-speech-lookback-seconds", 2.0 if self.vad_model_type == "silero" else 1.5),
             "vad-recent-speech-threshold": self.config.get("vad-recent-speech-threshold", 0.15 if self.vad_model_type == "silero" else 0.10)
         }
         
@@ -69,7 +69,6 @@ class FrameSpeechTester:
         
         print("Loading frame-level speech detector...")
         self.frame_detector = FrameLevelSpeechDetector(
-            quiet_mode=False, 
             vad_model_type=self.vad_model_type,
             config=vad_config
         )
