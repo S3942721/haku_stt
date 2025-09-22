@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>STT Button Controls</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 10px;
+            padding: 30px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+        }
+        
+        .connection-section {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .connection-controls {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+        
+        .connection-status {
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: bold;
+            color: white;
+        }
+        
+        .status-disconnected {
+            background-color: #dc3545;
+        }
+        
+        .status-connected {
+            background-color: #28a745;
+        }
+        
+        .status-connecting {
+            background-color: #ffc107;
+            color: #333;
+        }
+        
+        input[type="text"] {
+            padding: 8px 12px;
+            border: 2px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        .mode-section {
+            margin-bottom: 30px;
+            padding: 20px;
+            background: #e3f2fd;
+            border-radius: 8px;
+        }
+        
+        .current-mode {
+            font-size: 18px;
+            font-weight: bold;
+            color: #1976d2;
+            margin-bottom: 15px;
+        }
+        
+        .button-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .button-card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+            text-align: center;
+            border: 2px solid transparent;
+            transition: all 0.2s ease;
+        }
+        
+        .button-card.active {
+            border-color: #007bff;
+            background-color: #e7f3ff;
+        }
+        
+        .button-card h3 {
+            margin: 0 0 10px 0;
+            color: #333;
+            font-size: 16px;
+        }
+        
+        .button-card p {
+            margin: 0 0 15px 0;
+            color: #666;
+            font-size: 14px;
+        }
+        
+        .control-button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            margin: 2px;
+            transition: background-color 0.2s ease;
+        }
+        
+        .control-button:hover {
+            background: #0056b3;
+        }
+        
+        .control-button:active {
+            transform: scale(0.98);
+        }
+        
+        .control-button.pressed {
+            background: #28a745;
+        }
+        
+        .mode-button {
+            background: #6f42c1;
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: bold;
+            transition: background-color 0.2s ease;
+        }
+        
+        .mode-button:hover {
+            background: #5a32a3;
+        }
+        
+        .output-section {
+            margin-top: 30px;
+        }
+        
+        .output-container {
+            background: #2d3748;
+            color: #e2e8f0;
+            border-radius: 8px;
+            padding: 20px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            min-height: 200px;
+            max-height: 400px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        
+        .partial-text {
+            color: #a0aec0;
+            font-style: italic;
+        }
+        
+        .complete-text {
+            color: #68d391;
+            font-weight: bold;
+        }
+        
+        .status-message {
+            color: #63b3ed;
+        }
+        
+        .error-message {
+            color: #fc8181;
+        }
+        
+        .clear-output {
+            background: #718096;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-bottom: 10px;
+        }
+        
+        .clear-output:hover {
+            background: #4a5568;
+        }
+        
+        @media (max-width: 768px) {
+            .connection-controls {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            
+            .button-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎤 STT Button Controls</h1>
+        <p class="subtitle">WebSocket control interface for Speech-to-Text system</p>
+        
+        <!-- Connection Section -->
+        <div class="connection-section">
+            <h3>Connection Settings</h3>
+            <div class="connection-controls">
+                <label>WebSocket URI:</label>
+                <input type="text" id="websocketUri" value="ws://localhost:8765" placeholder="ws://localhost:8765">
+                <button id="connectBtn" class="control-button">Connect</button>
+                <span id="connectionStatus" class="connection-status status-disconnected">Disconnected</span>
+            </div>
+        </div>
+        
+        <!-- Mode Section -->
+        <div class="mode-section">
+            <div class="current-mode">Current Mode: <span id="currentMode">Standard</span></div>
+            <button id="modeSwitch" class="mode-button">Switch to Push-to-Talk Mode</button>
+        </div>
+        
+        <!-- Button Controls -->
+        <div class="button-grid">
+            <div class="button-card" id="manualEouCard">
+                <h3>Manual EOU</h3>
+                <p>Trigger end-of-utterance manually</p>
+                <button id="manualEouBtn" class="control-button">Trigger EOU</button>
+            </div>
+            
+            <div class="button-card" id="keepListeningCard">
+                <h3>Keep Listening</h3>
+                <p>Override automatic EOU detection</p>
+                <button id="keepListeningBtn" class="control-button" 
+                        onmousedown="sendButtonCommand('keep_listening', 'press')"
+                        onmouseup="sendButtonCommand('keep_listening', 'release')"
+                        ontouchstart="sendButtonCommand('keep_listening', 'press')"
+                        ontouchend="sendButtonCommand('keep_listening', 'release')">Hold to Keep Listening</button>
+            </div>
+            
+            <div class="button-card" id="notListenCard">
+                <h3>Mute</h3>
+                <p>Stop processing audio temporarily</p>
+                <button id="notListenBtn" class="control-button"
+                        onmousedown="sendButtonCommand('not_listen', 'press')"
+                        onmouseup="sendButtonCommand('not_listen', 'release')"
+                        ontouchstart="sendButtonCommand('not_listen', 'press')"
+                        ontouchend="sendButtonCommand('not_listen', 'release')">Hold to Mute</button>
+            </div>
+            
+            <div class="button-card" id="pushToTalkCard">
+                <h3>Push-to-Talk</h3>
+                <p>Hold to activate microphone (PTT mode)</p>
+                <button id="pushToTalkBtn" class="control-button"
+                        onmousedown="sendButtonCommand('push_to_talk', 'press')"
+                        onmouseup="sendButtonCommand('push_to_talk', 'release')"
+                        ontouchstart="sendButtonCommand('push_to_talk', 'press')"
+                        ontouchend="sendButtonCommand('push_to_talk', 'release')">Hold to Talk</button>
+            </div>
+        </div>
+        
+        <!-- Output Section -->
+        <div class="output-section">
+            <h3>STT Output</h3>
+            <button class="clear-output" onclick="clearOutput()">Clear Output</button>
+            <div id="output" class="output-container">Waiting for STT output...\n</div>
+        </div>
+    </div>
+
+    <script>
+        // WebSocket connection
+        let websocket = null;
+        let isConnected = false;
+        let currentMode = 'standard';
+        let buttonStates = {
+            'manual_eou': false,
+            'keep_listening': false,
+            'not_listen': false,
+            'push_to_talk': false
+        };
+
+        // DOM elements
+        const connectBtn = document.getElementById('connectBtn');
+        const connectionStatus = document.getElementById('connectionStatus');
+        const websocketUri = document.getElementById('websocketUri');
+        const output = document.getElementById('output');
+        const currentModeSpan = document.getElementById('currentMode');
+        const modeSwitchBtn = document.getElementById('modeSwitch');
+        const manualEouBtn = document.getElementById('manualEouBtn');
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function() {
+            connectBtn.addEventListener('click', toggleConnection);
+            modeSwitchBtn.addEventListener('click', switchMode);
+            manualEouBtn.addEventListener('click', () => sendButtonCommand('manual_eou', 'press'));
+            
+            // Prevent context menu on buttons to avoid interference with touch events
+            document.querySelectorAll('.control-button').forEach(btn => {
+                btn.addEventListener('contextmenu', e => e.preventDefault());
+            });
+        });
+
+        function toggleConnection() {
+            if (isConnected) {
+                disconnect();
+            } else {
+                connect();
+            }
+        }
+
+        function connect() {
+            const uri = websocketUri.value.trim();
+            if (!uri) {
+                addOutput('Please enter a WebSocket URI', 'error-message');
+                return;
+            }
+
+            try {
+                updateConnectionStatus('connecting');
+                addOutput(`Connecting to ${uri}...`, 'status-message');
+                
+                websocket = new WebSocket(uri);
+                
+                websocket.onopen = function(event) {
+                    isConnected = true;
+                    updateConnectionStatus('connected');
+                    addOutput('Connected to STT server!', 'status-message');
+                    
+                    // Send initial ping
+                    sendCommand({
+                        type: 'control',
+                        action: 'ping'
+                    });
+                };
+                
+                websocket.onmessage = function(event) {
+                    try {
+                        const data = JSON.parse(event.data);
+                        handleMessage(data);
+                    } catch (e) {
+                        addOutput(`Raw: ${event.data}`, 'status-message');
+                    }
+                };
+                
+                websocket.onclose = function(event) {
+                    isConnected = false;
+                    updateConnectionStatus('disconnected');
+                    addOutput('Disconnected from STT server', 'status-message');
+                    websocket = null;
+                };
+                
+                websocket.onerror = function(error) {
+                    addOutput(`Connection error: ${error}`, 'error-message');
+                    updateConnectionStatus('disconnected');
+                };
+                
+            } catch (error) {
+                addOutput(`Failed to connect: ${error}`, 'error-message');
+                updateConnectionStatus('disconnected');
+            }
+        }
+
+        function disconnect() {
+            if (websocket) {
+                websocket.close();
+            }
+        }
+
+        function updateConnectionStatus(status) {
+            connectionStatus.className = `connection-status status-${status}`;
+            
+            switch (status) {
+                case 'connected':
+                    connectionStatus.textContent = 'Connected';
+                    connectBtn.textContent = 'Disconnect';
+                    connectBtn.style.backgroundColor = '#dc3545';
+                    break;
+                case 'connecting':
+                    connectionStatus.textContent = 'Connecting...';
+                    connectBtn.textContent = 'Cancel';
+                    break;
+                case 'disconnected':
+                default:
+                    connectionStatus.textContent = 'Disconnected';
+                    connectBtn.textContent = 'Connect';
+                    connectBtn.style.backgroundColor = '#007bff';
+                    break;
+            }
+        }
+
+        function sendCommand(command) {
+            if (!isConnected || !websocket) {
+                addOutput('Not connected to STT server', 'error-message');
+                return false;
+            }
+            
+            try {
+                websocket.send(JSON.stringify(command));
+                return true;
+            } catch (error) {
+                addOutput(`Failed to send command: ${error}`, 'error-message');
+                return false;
+            }
+        }
+
+        function sendButtonCommand(buttonName, action) {
+            const command = {
+                type: 'button',
+                button: buttonName,
+                action: action
+            };
+            
+            if (sendCommand(command)) {
+                updateButtonState(buttonName, action);
+                addOutput(`Button: ${buttonName} ${action}`, 'status-message');
+            }
+        }
+
+        function updateButtonState(buttonName, action) {
+            if (action === 'press') {
+                buttonStates[buttonName] = true;
+            } else if (action === 'release') {
+                buttonStates[buttonName] = false;
+            } else if (action === 'toggle') {
+                buttonStates[buttonName] = !buttonStates[buttonName];
+            }
+            
+            // Update UI
+            const card = document.getElementById(buttonName + 'Card');
+            if (card) {
+                card.classList.toggle('active', buttonStates[buttonName]);
+            }
+        }
+
+        function switchMode() {
+            sendCommand({
+                type: 'button',
+                button: 'mode_switch',
+                action: 'toggle'
+            });
+        }
+
+        function handleMessage(data) {
+            const messageType = data.type || 'unknown';
+            
+            switch (messageType) {
+                case 'partial':
+                    updatePartialText(data.text || '');
+                    break;
+                    
+                case 'complete':
+                    addOutput(`[COMPLETE] ${data.text || ''}`, 'complete-text');
+                    break;
+                    
+                case 'status':
+                    const status = data.status || 'unknown';
+                    const details = data.details || {};
+                    addOutput(`[STATUS] ${status}`, 'status-message');
+                    if (Object.keys(details).length > 0) {
+                        addOutput(`Details: ${JSON.stringify(details, null, 2)}`, 'status-message');
+                    }
+                    break;
+                    
+                case 'button_ack':
+                    const button = data.button || 'unknown';
+                    const action = data.action || 'unknown';
+                    // Don't display button acknowledgments in output to reduce noise
+                    console.log(`Button acknowledged: ${button} ${action}`);
+                    break;
+                    
+                case 'pong':
+                    addOutput('[PONG] Server is alive', 'status-message');
+                    break;
+                    
+                case 'error':
+                    addOutput(`[ERROR] ${data.error || 'Unknown error'}`, 'error-message');
+                    break;
+                    
+                default:
+                    addOutput(`[${messageType.toUpperCase()}] ${JSON.stringify(data)}`, 'status-message');
+                    break;
+            }
+        }
+
+        let lastPartialLine = null;
+
+        function updatePartialText(text) {
+            const outputElement = document.getElementById('output');
+            
+            if (lastPartialLine) {
+                // Remove the last partial line
+                outputElement.removeChild(lastPartialLine);
+                lastPartialLine = null;
+            }
+            
+            if (text.trim()) {
+                // Add new partial line
+                const partialSpan = document.createElement('span');
+                partialSpan.className = 'partial-text';
+                partialSpan.textContent = `[PARTIAL] ${text}\n`;
+                outputElement.appendChild(partialSpan);
+                lastPartialLine = partialSpan;
+                
+                // Auto-scroll to bottom
+                outputElement.scrollTop = outputElement.scrollHeight;
+            }
+        }
+
+        function addOutput(text, className = '') {
+            const outputElement = document.getElementById('output');
+            
+            // Clear any partial text when adding complete output
+            if (lastPartialLine && className !== 'partial-text') {
+                outputElement.removeChild(lastPartialLine);
+                lastPartialLine = null;
+            }
+            
+            const timestamp = new Date().toLocaleTimeString();
+            const span = document.createElement('span');
+            if (className) {
+                span.className = className;
+            }
+            span.textContent = `[${timestamp}] ${text}\n`;
+            
+            outputElement.appendChild(span);
+            outputElement.scrollTop = outputElement.scrollHeight;
+        }
+
+        function clearOutput() {
+            const outputElement = document.getElementById('output');
+            outputElement.innerHTML = 'Output cleared.\n';
+            lastPartialLine = null;
+        }
+
+        // Update mode display when mode changes
+        function updateModeDisplay(mode) {
+            currentMode = mode;
+            currentModeSpan.textContent = mode.charAt(0).toUpperCase() + mode.slice(1);
+            
+            if (mode === 'push_to_talk') {
+                modeSwitchBtn.textContent = 'Switch to Standard Mode';
+                document.getElementById('pushToTalkCard').style.borderColor = '#28a745';
+                document.getElementById('pushToTalkCard').style.backgroundColor = '#f8fff9';
+            } else {
+                modeSwitchBtn.textContent = 'Switch to Push-to-Talk Mode';
+                document.getElementById('pushToTalkCard').style.borderColor = 'transparent';
+                document.getElementById('pushToTalkCard').style.backgroundColor = 'white';
+            }
+        }
+
+        // Keyboard shortcuts (optional - can be removed if not wanted)
+        document.addEventListener('keydown', function(event) {
+            if (!isConnected) return;
+            
+            switch (event.code) {
+                case 'Space':
+                    event.preventDefault();
+                    sendButtonCommand('manual_eou', 'press');
+                    break;
+                case 'ControlLeft':
+                case 'ControlRight':
+                    event.preventDefault();
+                    sendButtonCommand('keep_listening', 'press');
+                    break;
+                case 'ShiftLeft':
+                case 'ShiftRight':
+                    event.preventDefault();
+                    sendButtonCommand('not_listen', 'press');
+                    break;
+                case 'AltLeft':
+                case 'AltRight':
+                    event.preventDefault();
+                    sendButtonCommand('push_to_talk', 'press');
+                    break;
+                case 'KeyM':
+                    event.preventDefault();
+                    switchMode();
+                    break;
+            }
+        });
+
+        document.addEventListener('keyup', function(event) {
+            if (!isConnected) return;
+            
+            switch (event.code) {
+                case 'ControlLeft':
+                case 'ControlRight':
+                    sendButtonCommand('keep_listening', 'release');
+                    break;
+                case 'ShiftLeft':
+                case 'ShiftRight':
+                    sendButtonCommand('not_listen', 'release');
+                    break;
+                case 'AltLeft':
+                case 'AltRight':
+                    sendButtonCommand('push_to_talk', 'release');
+                    break;
+            }
+        });
+    </script>
+</body>
+</html>

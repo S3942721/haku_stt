@@ -40,9 +40,17 @@ try:
     REMOTE_AUDIO_AVAILABLE = True
 except ImportError:
     # Can't use logger here as it's not set up yet
-    import sys
     print("WARNING: Remote audio stream not available - falling back to microphone only", file=sys.stderr)
     REMOTE_AUDIO_AVAILABLE = False
+
+# New: WebSocket browser audio stream import
+try:
+    from websocket_audio_stream import WebSocketAudioStream
+    BROWSER_AUDIO_AVAILABLE = True
+except ImportError:
+    # Can't use logger here as it's not set up yet
+    print("WARNING: WebSocket audio stream not available - install websockets", file=sys.stderr)
+    BROWSER_AUDIO_AVAILABLE = False
 
 # Add EOU detection imports
 import onnxruntime as ort
@@ -178,6 +186,114 @@ class LoggerMixin:
         
         # Prevent propagation to root logger to avoid duplicate messages
         self.logger.propagate = False
+
+class ButtonController(LoggerMixin):
+    """Controller for handling button inputs via WebSocket commands only"""
+    
+    def __init__(self, log_config=None):
+        """Initialize button controller for WebSocket-only operation"""
+        if log_config is None:
+            log_config = {"log_level": "debug"}
+        self.__init_logger__("ButtonController", **log_config)
+        
+        # Button states
+        self.button_states = {
+            'manual_eou': False,
+            'keep_listening': False,
+            'not_listen': False,
+            'push_to_talk': False,
+            'mode_switch': False
+        }
+        
+        # Operating modes
+        self.current_mode = 'standard'  # 'standard' or 'push_to_talk'
+        
+        # Button callbacks
+        self.button_callbacks = {}
+        
+        self.logger.info("ButtonController initialized for WebSocket-only operation")
+    
+    def set_callback(self, button_name, callback_func):
+        """Set callback function for button events"""
+        self.button_callbacks[button_name] = callback_func
+        self.logger.debug(f"Callback set for button: {button_name}")
+    
+    def get_button_state(self, button_name):
+        """Get current state of a button"""
+        return self.button_states.get(button_name, False)
+    
+    def set_button_state(self, button_name, state, trigger_callback=True):
+        """Set button state and optionally trigger callback"""
+        old_state = self.button_states.get(button_name, False)
+        self.button_states[button_name] = state
+        
+        # Trigger callback if state changed
+        if trigger_callback and old_state != state and button_name in self.button_callbacks:
+            try:
+                self.button_callbacks[button_name](button_name, state)
+            except Exception as e:
+                self.logger.error(f"Error in callback for {button_name}: {e}")
+    
+    def get_mode(self):
+        """Get current operating mode"""
+        return self.current_mode
+    
+    def set_mode(self, mode):
+        """Set operating mode"""
+        if mode in ['standard', 'push_to_talk']:
+            old_mode = self.current_mode
+            self.current_mode = mode
+            self.logger.info(f"Mode changed from {old_mode} to {mode}")
+            
+            # Trigger mode change callback if available
+            if 'mode_change' in self.button_callbacks:
+                try:
+                    self.button_callbacks['mode_change'](mode, old_mode)
+                except Exception as e:
+                    self.logger.error(f"Error in mode change callback: {e}")
+        else:
+            self.logger.warning(f"Invalid mode: {mode}")
+    
+    def process_websocket_command(self, command):
+        """Process button commands from WebSocket"""
+        if not isinstance(command, dict):
+            return False
+            
+        command_type = command.get("type")
+        if command_type != "button":
+            return False
+            
+        button_name = command.get("button")
+        action = command.get("action", "press")  # "press", "release", "toggle"
+        
+        if button_name not in self.button_states:
+            self.logger.warning(f"Unknown button: {button_name}")
+            return False
+        
+        if action == "press":
+            # Special handling for manual_eou - always trigger callback on press
+            if button_name == "manual_eou":
+                if button_name in self.button_callbacks:
+                    try:
+                        self.button_callbacks[button_name](button_name, True)
+                    except Exception as e:
+                        self.logger.error(f"Error in callback for {button_name}: {e}")
+            else:
+                self.set_button_state(button_name, True)
+        elif action == "release":
+            self.set_button_state(button_name, False)
+        elif action == "toggle":
+            current_state = self.get_button_state(button_name)
+            self.set_button_state(button_name, not current_state)
+        elif action == "mode_switch" and button_name == "mode_switch":
+            new_mode = 'push_to_talk' if self.current_mode == 'standard' else 'standard'
+            self.set_mode(new_mode)
+        else:
+            self.logger.warning(f"Unknown action for {button_name}: {action}")
+            return False
+        
+        self.logger.debug(f"WebSocket button command: {button_name} {action}")
+        return True
 
 class UnifiedEOUDetector(LoggerMixin):
     def __init__(self, log_config=None, config=None):
@@ -1414,6 +1530,29 @@ class WebSocketServer(LoggerMixin):
                     "error": f"Unknown control action: {action}",
                     "timestamp": time.time()
                 }))
+        
+        elif command_type == "button":
+            # Handle button commands - forward to button controller
+            # Add button command to queue for main thread processing
+            self.command_queue.put({
+                "type": "button",
+                "command": command,
+                "timestamp": time.time(),
+                "client": websocket.remote_address if hasattr(websocket, 'remote_address') else "unknown"
+            })
+            
+            # Send immediate acknowledgment
+            response = {
+                "type": "button_ack",
+                "button": command.get("button"),
+                "action": command.get("action"),
+                "status": "queued",
+                "timestamp": time.time()
+            }
+            await websocket.send(json.dumps(response))
+            
+            self.logger.verbose(f"WebSocket button command received: {command.get('button')} {command.get('action')}")
+            
         else:
             await websocket.send(json.dumps({
                 "type": "error", 
@@ -1636,6 +1775,16 @@ class OnlineASRWithPunctuation(LoggerMixin):
             websocket_server.start_time = self.start_time
             websocket_server.current_state = self.current_state
 
+        # Initialize button controller
+        self.button_controller = ButtonController(log_config)
+        self._setup_button_callbacks()
+        
+        # Audio control state for button functionality
+        self.audio_muted = False
+        self.push_to_talk_mode = False
+        self.keep_listening_override = False
+        self.pending_eou_from_keep_listening = False
+
         # Initialize models
         self._setup_asr_model()
         if punct_model_name:
@@ -1658,6 +1807,169 @@ class OnlineASRWithPunctuation(LoggerMixin):
         self.current_utterance = ""  # Accumulate text for complete utterance output
         self._setup_preprocessing()
         self._reset_streaming_state()
+    
+    def _setup_button_callbacks(self):
+        """Setup callbacks for button controller"""
+        self.button_controller.set_callback('manual_eou', self._on_manual_eou)
+        self.button_controller.set_callback('keep_listening', self._on_keep_listening)
+        self.button_controller.set_callback('not_listen', self._on_not_listen)
+        self.button_controller.set_callback('push_to_talk', self._on_push_to_talk)
+        self.button_controller.set_callback('mode_change', self._on_mode_change)
+        
+        self.logger.debug("Button callbacks configured")
+    
+    def _on_manual_eou(self, button_name, pressed):
+        """Handle manual EOU button press"""
+        if pressed:  # Only trigger on press, not release
+            self.logger.debug("Manual EOU triggered")
+            
+            # Use the same complete EOU processing as automatic EOU
+            self._trigger_eou_immediately()
+    
+    def _on_keep_listening(self, button_name, pressed):
+        """Handle keep listening override button"""
+        self.keep_listening_override = pressed
+        
+        if pressed:
+            self.logger.debug("Keep listening override activated - will ignore automatic EOU")
+        else:
+            self.logger.debug("Keep listening override released")
+            
+            # Check if we had a pending EOU while keep listening was active
+            if self.pending_eou_from_keep_listening:
+                self.logger.info("Keep listening released - triggering pending EOU")
+                self._trigger_eou_immediately()
+                self.pending_eou_from_keep_listening = False
+    
+    def _on_not_listen(self, button_name, pressed):
+        """Handle not listen button (mute audio while held)"""
+        self.audio_muted = pressed
+        
+        if pressed:
+            self.logger.debug("Not listen activated - audio muted")
+        else:
+            self.logger.debug("Not listen released - audio unmuted")
+    
+    def _on_push_to_talk(self, button_name, pressed):
+        """Handle push to talk button (only in PTT mode)"""
+        if self.button_controller.get_mode() == 'push_to_talk':
+            # In PTT mode, this controls whether we listen
+            self.push_to_talk_mode = pressed
+            
+            if pressed:
+                self.logger.debug("Push to talk activated - listening enabled")
+                # Reset state to start fresh
+                self._reset_streaming_state(reset_conversation=True, send_websocket_updates=False)
+            else:
+                self.logger.debug("Push to talk released - processing any accumulated speech")
+                
+                # Trigger EOU on release if we have text
+                if self.current_utterance.strip():
+                    self.logger.info("Push to talk released - auto EOU triggered")
+                    self._trigger_eou_immediately()
+        else:
+            self.logger.debug(f"Push to talk button pressed but not in PTT mode (current: {self.button_controller.get_mode()})")
+    
+    def _on_mode_change(self, new_mode, old_mode):
+        """Handle mode change between standard and push-to-talk"""
+        self.logger.info(f"Mode changed from {old_mode} to {new_mode}")
+        
+        # Send WebSocket notification
+        if self.websocket_server:
+            self.websocket_server.send_status_update('mode_changed', {
+                'new_mode': new_mode,
+                'old_mode': old_mode
+            })
+        
+        # Reset states when changing modes
+        self.audio_muted = False
+        self.push_to_talk_mode = False
+        self.keep_listening_override = False
+        self.pending_eou_from_keep_listening = False
+        
+        # In PTT mode, start muted until button is pressed
+        if new_mode == 'push_to_talk':
+            self.push_to_talk_mode = False  # Start not listening in PTT mode
+            self.logger.info("Push-to-talk mode: Press and hold PTT button to start listening")
+        else:
+            self.push_to_talk_mode = True  # Always listen in standard mode
+            self.logger.info("Standard mode: Always listening")
+        
+        # Reset streaming state
+        self._reset_streaming_state(reset_conversation=True, send_websocket_updates=False)
+    
+    def _trigger_eou_immediately(self):
+        """Immediately trigger EOU processing"""
+        if self.current_utterance.strip():
+            final_text = self._apply_punctuation(self.current_utterance)
+            
+            # Use the same complete EOU processing as automatic EOU
+            self._process_complete_utterance_output(final_text, quiet_mode=False, triggered=True)
+            
+            # Reset state
+            self._reset_streaming_state(reset_conversation=True, send_websocket_updates=False)
+    
+    def _process_complete_utterance_output(self, complete_utterance, quiet_mode=False, triggered=False):
+        """Process and output a complete utterance with consistent formatting"""
+        if not complete_utterance.strip():
+            return
+        
+        # Send via WebSocket
+        if self.websocket_server:
+            self.websocket_server.send_complete_utterance(complete_utterance)
+        
+        # Log using the same format as automatic EOU
+        if triggered:
+            self.logger.critical(f"COMPLETE UTTERANCE (TRIGGERED): {complete_utterance}")
+        else:
+            self.logger.critical(f"COMPLETE UTTERANCE: {complete_utterance}")
+        
+        # Console output with decorative separators (matches normal EOU flow)
+        if quiet_mode:
+            print(f"\n{'='*70}")
+            print(f"COMPLETE UTTERANCE:")
+            print(f"{'='*70}")
+            print(f"{complete_utterance}")
+            print(f"{'='*70}\n")
+        else:
+            print(f"\n{'='*70}")
+            print(f"[COMPLETE UTTERANCE - ASR FULLY RESET]")
+            print(f"{complete_utterance}")
+            print(f"{'='*70}")
+    
+    def should_process_audio_with_buttons(self, audio_chunk):
+        """Check if audio should be processed based on button states and modes"""
+        # Check not listen button (always takes precedence)
+        if self.audio_muted:
+            return False
+        
+        # Check push-to-talk mode
+        current_mode = self.button_controller.get_mode()
+        if current_mode == 'push_to_talk':
+            # In PTT mode, only process if PTT button is held
+            return self.button_controller.get_button_state('push_to_talk')
+        else:
+            # In standard mode, always process unless muted
+            return True
+    
+    def check_eou_with_buttons(self, text, audio_chunk):
+        """Enhanced EOU checking that considers button states"""
+        # If keep listening override is active, don't trigger automatic EOU
+        if self.keep_listening_override:
+            # Check if automatic EOU would have triggered
+            if self.unified_eou_detector:
+                eou_result = self.unified_eou_detector.detect_eou(text, audio_chunk)
+                if eou_result.get("is_eou", False):
+                    self.pending_eou_from_keep_listening = True
+                    self.logger.debug("Automatic EOU detected but suppressed by keep listening override")
+            return False
+        
+        # Normal EOU detection
+        if self.unified_eou_detector:
+            eou_result = self.unified_eou_detector.detect_eou(text, audio_chunk)
+            return eou_result.get("is_eou", False)
+        
+        return False
     
     def _setup_asr_model(self):
         """Load and configure the ASR model"""
@@ -1975,6 +2287,11 @@ class OnlineASRWithPunctuation(LoggerMixin):
         if not self.should_process_audio():
             return "", "", False, None
         
+        # Check button-based audio processing control
+        if not self.should_process_audio_with_buttons(audio_chunk):
+            # Return silence - effectively muting the audio input
+            return "", "", False, None
+
         try:
             # Debug audio chunk input (very detailed)
             if self.step_num % 50 == 0:
@@ -2063,19 +2380,13 @@ class OnlineASRWithPunctuation(LoggerMixin):
                 if len(self.conversation_buffer) % 3 != 0:  # Check every 3rd update
                     pass
                 else:
-                    # Analyze using unified EOU detector
+                    # Use button-aware EOU detection
                     full_conversation = " ".join(self.conversation_buffer)
-                    eou_result = self.unified_eou_detector.detect_eou(
-                        text=full_conversation, 
-                        audio_data=audio_data
-                    )
-                    is_eou = eou_result["is_eou"]
+                    is_eou = self.check_eou_with_buttons(full_conversation, audio_data)
                     
-                    # Log detailed EOU information
-                    if eou_result["is_eou"]:
-                        self.logger.info(f"Unified EOU triggered - confidence: {eou_result['confidence']:.3f}, "
-                                       f"methods: {eou_result['triggered_by']}")
-                        self.logger.debug(f"Method scores: {eou_result['method_scores']}")
+                    # Log detailed EOU information if triggered
+                    if is_eou:
+                        self.logger.info("EOU triggered (considering button states)")
             elif is_frame_eou:
                 # Fallback to legacy frame-based EOU if unified detector not available
                 is_eou = is_frame_eou
@@ -2232,6 +2543,14 @@ class OnlineASRWithPunctuation(LoggerMixin):
                 self.logger.info(f"Received {action} command - Purging buffers and resetting ASR state")
                 
                 # No need to send additional reset messages since _purge_and_reset() handles it
+            
+            # Handle button commands
+            elif command.get("type") == "button":
+                button_command = command.get("command", {})
+                if self.button_controller.process_websocket_command(button_command):
+                    self.logger.debug(f"Processed button command: {button_command}")
+                else:
+                    self.logger.warning(f"Failed to process button command: {button_command}")
 
     def should_process_audio(self):
         """Check if audio processing should continue"""
@@ -2279,21 +2598,25 @@ def list_audio_devices():
     # Add remote audio stream option if available
     if REMOTE_AUDIO_AVAILABLE:
         logger.info(f"  remote: Remote audio stream (GStreamer RTP)")
+    # Add browser audio stream option if available
+    if BROWSER_AUDIO_AVAILABLE:
+        logger.info(f"  browser: Browser WebSocket audio stream")
     
     p.terminate()
     return input_devices
 
-def run_streaming_asr_with_punct(asr_system, device_id=None, chunk_size_ms=None, show_raw=False, quiet_mode=False, remote_audio_port=5004):
+def run_streaming_asr_with_punct(asr_system, device_id=None, chunk_size_ms=None, show_raw=False, quiet_mode=False, remote_audio_port=5004, browser_audio_port=8787):
     """
-    Run streaming ASR with punctuation and EOU detection using microphone or remote audio stream
+    Run streaming ASR with punctuation and EOU detection using microphone, remote RTP, or browser WS audio
     
     Args:
         asr_system: OnlineASRWithPunctuation instance
-        device_id: Audio device ID (None for interactive selection, 'remote' for remote stream)
+        device_id: Audio device ID (None for interactive selection, 'remote' for remote stream, 'browser' for browser WS audio)
         chunk_size_ms: Chunk size in milliseconds (None for automatic)
         show_raw: Whether to show raw (unpunctuated) text
         quiet_mode: If True, suppress all logs and only show punctuated output
         remote_audio_port: Port for remote audio stream
+        browser_audio_port: Port for browser WebSocket audio stream
     """
     # Calculate chunk size
     if chunk_size_ms is None:
@@ -2310,16 +2633,19 @@ def run_streaming_asr_with_punct(asr_system, device_id=None, chunk_size_ms=None,
             {"chunk_size_ms": chunk_size_ms, "device_id": device_id}
         )
     
-    # Check if remote audio stream is requested
+    # Determine source
     use_remote_audio = (device_id == 'remote' or device_id == -1) and REMOTE_AUDIO_AVAILABLE
+    use_browser_audio = (device_id == 'browser') and BROWSER_AUDIO_AVAILABLE
     
-    if use_remote_audio:
-        # Use remote audio stream
+    if use_browser_audio:
+        return run_streaming_asr_with_browser_audio(
+            asr_system, browser_audio_port, chunk_size_ms, show_raw, quiet_mode
+        )
+    elif use_remote_audio:
         return run_streaming_asr_with_remote_audio(
             asr_system, remote_audio_port, chunk_size_ms, show_raw, quiet_mode
         )
     else:
-        # Use local microphone (existing code)
         return run_streaming_asr_with_microphone(
             asr_system, device_id, chunk_size_ms, show_raw, quiet_mode
         )
@@ -2410,20 +2736,8 @@ def run_streaming_asr_with_remote_audio(asr_system, remote_port, chunk_size_ms, 
                     
                     # Handle EOU - output complete utterance with clear separators
                     if is_eou and complete_utterance:
-                        # Always log complete utterances at CRITICAL level to ensure they're always shown
-                        logger.critical(f"COMPLETE UTTERANCE: {complete_utterance}")
-                        
-                        if quiet_mode:
-                            print(f"\n{'='*70}")
-                            print(f"COMPLETE UTTERANCE:")
-                            print(f"{'='*70}")
-                            print(f"{complete_utterance}")
-                            print(f"{'='*70}\n")
-                        else:
-                            print(f"\n{'='*70}")
-                            print(f"[COMPLETE UTTERANCE - ASR FULLY RESET]")
-                            print(f"{complete_utterance}")
-                            print(f"{'='*70}")
+                        # Use the shared complete utterance processing method
+                        asr_system._process_complete_utterance_output(complete_utterance, quiet_mode=quiet_mode)
                         
                         # Reset tracking variables for fresh start
                         last_raw = ""
@@ -2490,6 +2804,82 @@ def run_streaming_asr_with_remote_audio(asr_system, remote_port, chunk_size_ms, 
             if chunks_processed > 0:
                 print(f"Total chunks processed: {chunks_processed}")
                 print(f"Total transcriptions: {transcription_count}")
+
+def run_streaming_asr_with_browser_audio(asr_system, browser_port, chunk_size_ms, show_raw, quiet_mode):
+    """Run streaming ASR using browser WebSocket audio (PCM16 over WS)"""
+    logger = logging.getLogger("haku_stt.browser_audio")
+
+    if not BROWSER_AUDIO_AVAILABLE:
+        logger.error("Browser audio not available. Ensure websocket_audio_stream.py exists and 'websockets' is installed.")
+        return
+
+    if not quiet_mode:
+        logger.info(f"Starting browser WebSocket audio receiver on port {browser_port}")
+        logger.info("Waiting for browser client to connect and stream audio...")
+
+    ws_stream = WebSocketAudioStream(
+        listen_port=browser_port,
+        sample_rate=SAMPLE_RATE,
+        verbose=not quiet_mode,
+        host='0.0.0.0'
+    )
+
+    if not ws_stream.start():
+        logger.error("Failed to start WebSocket audio stream")
+        return
+
+    try:
+        frames_per_buffer = int(SAMPLE_RATE * chunk_size_ms / 1000) - 1
+        if not quiet_mode:
+            print("Browser audio stream started successfully")
+            print(f"Frames per buffer: {frames_per_buffer} (matching PyAudio)")
+            print(f"Chunk size: {chunk_size_ms}ms")
+            print("Listening for audio... (Press Ctrl+C to stop)")
+            print('=' * 50)
+
+        last_raw = ""
+        last_punct = ""
+
+        while True:
+            if not asr_system.should_process_audio():
+                time.sleep(0.05)
+                continue
+
+            chunk = ws_stream.read_audio_pyaudio_compatible(frames_per_buffer, timeout=1.0)
+            if chunk is None:
+                continue
+
+            result = asr_system.transcribe_chunk(chunk)
+            if not result:
+                continue
+
+            raw_text, punct_text, is_eou, complete_utterance = result
+
+            if is_eou and complete_utterance:
+                if asr_system.websocket_server:
+                    asr_system.websocket_server.send_complete_utterance(complete_utterance)
+                if not quiet_mode:
+                    print(complete_utterance)
+                last_raw = ""
+                last_punct = ""
+                continue
+
+            if show_raw:
+                if raw_text and raw_text != last_raw and not quiet_mode:
+                    print(raw_text)
+                last_raw = raw_text or last_raw
+            else:
+                if punct_text and punct_text != last_punct and not quiet_mode:
+                    print(punct_text)
+                last_punct = punct_text or last_punct
+
+    except KeyboardInterrupt:
+        if not quiet_mode:
+            logger.info("Stopping browser audio...")
+    finally:
+        ws_stream.stop()
+        if not quiet_mode:
+            logger.info("Browser audio stopped")
 
 def run_streaming_asr_with_microphone(asr_system, device_id, chunk_size_ms, show_raw, quiet_mode):
     """Run streaming ASR using local microphone (original implementation)"""
@@ -2573,23 +2963,8 @@ def run_streaming_asr_with_microphone(asr_system, device_id, chunk_size_ms, show
             
             # Handle EOU - output complete utterance with clear separators
             if is_eou and complete_utterance:
-                # Always log complete utterances at CRITICAL level to ensure they're always shown
-                logger = logging.getLogger("haku_stt.microphone")
-                logger.critical(f"COMPLETE UTTERANCE: {complete_utterance}")
-                
-                if quiet_mode:
-                    # In quiet mode, output complete utterance with separators
-                    print(f"\n{'='*70}")
-                    print(f"COMPLETE UTTERANCE:")
-                    print(f"{'='*70}")
-                    print(f"{complete_utterance}")
-                    print(f"{'='*70}\n")
-                else:
-                    # In non-quiet mode, show completion with separators
-                    print(f"\n{'='*70}")
-                    print(f"[COMPLETE UTTERANCE - ASR FULLY RESET]")
-                    print(f"{complete_utterance}")
-                    print(f"{'='*70}")
+                # Use the shared complete utterance processing method
+                asr_system._process_complete_utterance_output(complete_utterance, quiet_mode=quiet_mode)
                 
                 # Reset tracking variables for fresh start
                 last_raw = ""
@@ -2736,10 +3111,7 @@ def setup_global_logging(log_level="debug", log_format=None, log_file=None,
     else:
         resolved_level = logging.DEBUG
     
-    # Debug: Print the input and resolved level
-    print(f"[LOGGING] Input log level: {log_level} (type: {type(log_level)})")
-    print(f"[LOGGING] Resolved level: {resolved_level} ({logging.getLevelName(resolved_level)})")
-    
+    # Set the root logger level
     root_logger.setLevel(resolved_level)
     
     # Update all existing haku_stt loggers to match root level
@@ -2757,6 +3129,7 @@ def get_hardcoded_defaults():
         "decoder": "rnnt",
         "device": None,
         "remote-port": 5004,
+        "browser-audio-port": 8787,
         "chunk-size": None,
         "show-raw": False,
         "no-eou": False,
@@ -2923,7 +3296,7 @@ def main():
     lookahead = config["lookahead"]
     decoder = config["decoder"]
     device_id = config["device"]
-    remote_port = config["remote-port"]
+    remote_audio_port = config["remote-port"]
     chunk_size_ms = config["chunk-size"]
     show_raw = config["show-raw"]
     
@@ -2953,6 +3326,7 @@ def main():
     websocket_port = config["websocket-port"]
     websocket_ping_interval = config.get("websocket-ping-interval", 20)
     websocket_ping_timeout = config.get("websocket-ping-timeout", 10)
+    browser_audio_port = config.get("browser-audio-port", 8787)
     
     # Initialize WebSocket server if requested
     websocket_server = None
@@ -3068,12 +3442,26 @@ def main():
         main_logger.info(f"Lookahead: {lookahead}ms")
         main_logger.info(f"Decoder: {decoder}")
         if device_id == 'remote':
-            main_logger.info(f"Audio Input: Remote stream (port {remote_port})")
+            main_logger.info(f"Audio Input: Remote stream (port {remote_audio_port})")
+        elif device_id == 'browser':
+            main_logger.info(f"Audio Input: Browser WebSocket stream (port {browser_audio_port})")
         else:
             main_logger.info(f"Audio Input: {'Auto-select microphone' if device_id is None else f'Device {device_id}'}")
         if websocket_server:
             main_logger.info(f"WebSocket Output: ws://{websocket_host}:{websocket_port}")
         main_logger.info(f"Log level: {config.get('log-level', 'debug').upper()}")
+        
+        # Button controller ready for WebSocket commands
+        main_logger.info("Button controller ready for WebSocket commands")
+        main_logger.info("Open web_controls.html in your browser for button controls")
+        
+        # Log available button controls via WebSocket
+        main_logger.info("Button controls available via WebSocket:")
+        main_logger.info("  manual_eou: Manual EOU trigger")
+        main_logger.info("  keep_listening: Keep listening (override EOU)")
+        main_logger.info("  not_listen: Stop listening")
+        main_logger.info("  push_to_talk: Push-to-talk mode button")
+        main_logger.info("  mode_switch: Switch between standard/push-to-talk modes")
         
         # Send initial state via WebSocket
         if websocket_server:
@@ -3112,7 +3500,8 @@ def main():
             chunk_size_ms=chunk_size_ms,
             show_raw=show_raw,
             quiet_mode=quiet_mode,
-            remote_audio_port=remote_port
+            remote_audio_port=remote_audio_port,
+            browser_audio_port=browser_audio_port
         )
         
     except KeyboardInterrupt:
@@ -3120,6 +3509,10 @@ def main():
     except Exception as e:
         main_logger.error(f"System error: {e}", exc_info=True)
     finally:
+        # Clean up button controller (WebSocket-only, no keyboard monitoring to stop)
+        if 'asr_system' in locals() and hasattr(asr_system, 'button_controller'):
+            main_logger.info("Button controller cleaned up")
+        
         # Clean up WebSocket server
         if websocket_server:
             websocket_server.send_status_update("stopped", {"reason": "shutdown"})
