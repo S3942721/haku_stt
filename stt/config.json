@@ -1,0 +1,124 @@
+{
+  "mode-selection": "fast-eou",
+  "descriptions": {
+    "asr-model": "ASR model name to use",
+    "punct-model": "Punctuation model name (None to disable punctuation)",
+    "lookahead": "Lookahead size in milliseconds (0, 80, 480, 1040 for multi model)",
+    "decoder": "ASR decoder type to use (\"rnnt\" or \"ctc\")",
+    "device": "Audio device ID (number for microphone, 'remote' for remote stream, 'browser' for WebSocket audio, will prompt if not provided)",
+    "remote-port": "Port for remote audio stream (default: 5004)",
+    "browser-audio-port": "Port for browser audio WebSocket (default: 8787)",
+    "chunk-size": "Chunk size in milliseconds (auto-calculated if not provided)",
+    "show-raw": "Show both raw and punctuated text",
+    "no-eou": "Disable end-of-utterance detection",
+    "enable-text-eou": "Enable text-based EOU detection",
+    "eou-threshold": "Threshold for end-of-utterance detection (0.0-1.0, higher = less sensitive)",
+    "eou-min-words": "Minimum words required before considering text-based EOU",
+    "eou-confirmation-needed": "Number of consecutive positive detections needed for text-based EOU",
+    "vad-model": "VAD model to use: 'nvidia' for NeMo VAD or 'silero' for Silero VAD",
+    "vad-silence-threshold": "Number of consecutive low-activity frames needed for VAD-based EOU detection",
+    "vad-speech-threshold": "VAD probability threshold for speech detection (0.0-1.0). The probability above which a frame is considered speech",
+    "vad-activity-threshold": "Minimum frame activity ratio for speech detection (0.0-1.0). The proportion of frames in the analysis window that must be above the speech threshold to consider it as speech",
+    "vad-speech-proportion-threshold": "Speech proportion threshold for EOU detection (0.0-1.0, lower = more sensitive). When this is exceeded within the analysis window, an EOU is triggered.",
+    "vad-analysis-window": "Analysis window in seconds for speech proportion calculation",
+    "vad-consecutive-silence-threshold": "Consecutive silence duration in seconds needed for immediate EOU detection",
+    "vad-min-frames-for-eou": "Minimum frames needed before considering EOU (in seconds)",
+    "vad-recent-speech-lookback-seconds": "How far back to look for recent speech activity (in seconds)",
+    "vad-recent-speech-threshold": "Minimum speech proportion to consider recent activity",
+    "websocket-host": "WebSocket server host (enables WebSocket output when specified)",
+    "websocket-port": "WebSocket server port (default: 8765)",
+    "websocket-ping-interval": "WebSocket ping interval in seconds",
+    "websocket-ping-timeout": "WebSocket ping timeout in seconds",
+    "log-level": "Logging level: 'debug', 'info', 'warning', 'error', 'critical' (debug shows EOU info, info is quiet mode, verbose shows all details)",
+    "log-format": "Log message format string",
+    "log-file": "Optional log file path (None for console only)",
+    "log-max-size": "Maximum log file size in MB before rotation",
+    "log-backup-count": "Number of backup log files to keep"
+  },
+  "vad-defaults": {
+    "nvidia": {
+      "vad-speech-threshold": 0.25,
+      "vad-speech-proportion-threshold": 0.15,
+      "vad-analysis-window": 2.0,
+      "vad-consecutive-silence-threshold": 0.8,
+      "vad-min-frames-for-eou": 0.5,
+      "vad-recent-speech-lookback-seconds": 1.5,
+      "vad-recent-speech-threshold": 0.10
+    },
+    "silero": {
+      "vad-speech-threshold": 0.7,
+      "vad-speech-proportion-threshold": 0.2,
+      "vad-analysis-window": 4.0,
+      "vad-consecutive-silence-threshold": 1.5,
+      "vad-min-frames-for-eou": 0.64,
+      "vad-recent-speech-lookback-seconds": 5.0,
+      "vad-recent-speech-threshold": 0.15
+    }
+  },
+  "modes": {
+    "default": {
+      "asr-model": "stt_en_fastconformer_hybrid_large_streaming_multi",
+      "punct-model": "punctuation_en_bert",
+      "lookahead": 480,
+      "decoder": "rnnt",
+      "device": null,
+      "remote-port": 5004,
+      "browser-audio-port": 8787,
+      "chunk-size": null,
+      "show-raw": false,
+      "no-eou": false,
+      "enable-text-eou": false,
+      "eou-threshold": 0.75,
+      "eou-min-words": 4,
+      "eou-confirmation-needed": 2,
+      "vad-model": "nvidia",
+      "vad-silence-threshold": 15,
+      "vad-activity-threshold": 0.3,
+      "websocket-host": "0.0.0.0",
+      "websocket-port": 8765,
+      "websocket-ping-interval": 20,
+      "websocket-ping-timeout": 10,
+      "log-level": "debug",
+      "log-format": "[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s",
+      "log-file": null,
+      "log-max-size": 10,
+      "log-backup-count": 3
+    },
+    "fast": {
+      "asr-model": "stt_en_fastconformer_hybrid_large_streaming_80ms",
+      "lookahead": 80,
+      "chunk-size": 80,
+      "vad-analysis-window": 1.0,
+      "vad-consecutive-silence-threshold": 0.5
+    },
+    "slow": {
+      "asr-model": "stt_en_fastconformer_hybrid_large_streaming_1040ms",
+      "lookahead": 1040,
+      "chunk-size": 1040,
+      "vad-analysis-window": 3.0,
+      "vad-consecutive-silence-threshold": 1.0,
+      "eou-threshold": 0.9
+    },
+    "reliable": {
+      "enable-text-eou": false,
+      "punct-model": "punctuation_en_distilbert"
+    },
+    "optimised-vad": {
+      "enable-text-eou": true,
+      "vad-model": "silero"
+    },
+    "fast-eou": {
+      "vad-model": "silero",
+      "enable-text-eou": true,
+      "vad-speech-proportion-threshold": 0.1,
+      "vad-analysis-window": 2.0,
+      "vad-consecutive-silence-threshold": 0.6,
+      "vad-min-frames-for-eou": 0.3,
+      "vad-recent-speech-lookback-seconds": 5.0,
+      "vad-recent-speech-threshold": 0.1,
+      "eou-threshold": 0.7,
+      "eou-min-words": 2,
+      "eou-confirmation-needed": 1
+    }
+  }
+}
