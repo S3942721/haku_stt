@@ -57,6 +57,14 @@ import onnxruntime as ort
 from transformers import AutoTokenizer
 from huggingface_hub import hf_hub_download
 
+# Add Whisper imports
+try:
+    from transformers import WhisperProcessor, WhisperForConditionalGeneration
+    WHISPER_AVAILABLE = True
+except ImportError:
+    print("WARNING: Whisper not available - install transformers for full utterance analysis", file=sys.stderr)
+    WHISPER_AVAILABLE = False
+
 from omegaconf import OmegaConf, open_dict
 
 import nemo.collections.asr as nemo_asr
@@ -1734,6 +1742,180 @@ class WebSocketServer(LoggerMixin):
             except Exception as e:
                 self.logger.error(f"Error stopping WebSocket server: {e}")
 
+class WhisperBuffer(LoggerMixin):
+    """Audio buffer for full utterance analysis with Whisper model"""
+    
+    def __init__(self, buffer_duration=45, sample_rate=16000, whisper_model="distil-whisper/distil-small.en", 
+                 log_config=None):
+        """
+        Initialize Whisper buffer for full utterance analysis
+        
+        Args:
+            buffer_duration: Duration in seconds to keep audio buffer
+            sample_rate: Audio sample rate (default: 16000)
+            whisper_model: Whisper model name to use
+            log_config: Logging configuration
+        """
+        if log_config is None:
+            log_config = {"log_level": "debug"}
+        self.__init_logger__("WhisperBuffer", **log_config)
+        
+        self.buffer_duration = buffer_duration
+        self.sample_rate = sample_rate
+        self.whisper_model_name = whisper_model
+        self.max_buffer_samples = int(buffer_duration * sample_rate)
+        
+        # Audio buffer as deque for efficient operations
+        self.audio_buffer = deque(maxlen=self.max_buffer_samples)
+        
+        # Whisper model components
+        self.whisper_processor = None
+        self.whisper_model = None
+        self.whisper_device = None
+        
+        # Metrics
+        self.total_analyses = 0
+        self.total_processing_time = 0.0
+        
+        # Initialize Whisper model if available
+        if WHISPER_AVAILABLE:
+            self._load_whisper_model()
+        else:
+            self.logger.warning("Whisper not available - buffer analysis disabled")
+    
+    def _load_whisper_model(self):
+        """Load Whisper model and processor"""
+        try:
+            self.logger.info(f"Loading Whisper model: {self.whisper_model_name}")
+            
+            # Determine device
+            if torch.cuda.is_available():
+                self.whisper_device = "cuda"
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                self.whisper_device = "mps"
+            else:
+                self.whisper_device = "cpu"
+            
+            # Load processor and model
+            self.whisper_processor = WhisperProcessor.from_pretrained(self.whisper_model_name)
+            self.whisper_model = WhisperForConditionalGeneration.from_pretrained(self.whisper_model_name)
+            
+            # Move model to device
+            self.whisper_model.to(self.whisper_device)
+            self.whisper_model.eval()
+            
+            self.logger.info(f"Whisper model loaded successfully on {self.whisper_device}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load Whisper model: {e}")
+            self.whisper_processor = None
+            self.whisper_model = None
+    
+    def add_audio(self, audio_chunk):
+        """Add audio chunk to buffer"""
+        if isinstance(audio_chunk, np.ndarray):
+            # Convert to float32 if needed
+            if audio_chunk.dtype == np.int16:
+                audio_chunk = audio_chunk.astype(np.float32) / 32768.0
+            
+            # Add samples to buffer
+            for sample in audio_chunk:
+                self.audio_buffer.append(sample)
+    
+    def analyze_buffer(self):
+        """
+        Analyze current audio buffer with Whisper model
+        
+        Returns:
+            tuple: (transcription: str, processing_time: float, buffer_size: int)
+        """
+        if not self.whisper_processor or not self.whisper_model:
+            self.logger.warning("Whisper model not available for analysis")
+            return "", 0.0, 0
+        
+        if len(self.audio_buffer) == 0:
+            self.logger.debug("No audio in buffer to analyze")
+            return "", 0.0, 0
+        
+        start_time = time.time()
+        
+        try:
+            # Convert buffer to numpy array
+            audio_array = np.array(list(self.audio_buffer), dtype=np.float32)
+            buffer_size = len(audio_array)
+            
+            self.logger.debug(f"Analyzing buffer: {buffer_size} samples ({buffer_size/self.sample_rate:.2f}s)")
+            
+            # Process with Whisper
+            inputs = self.whisper_processor(
+                audio_array, 
+                sampling_rate=self.sample_rate, 
+                return_tensors="pt"
+            )
+            
+            # Move inputs to device
+            input_features = inputs.input_features.to(self.whisper_device)
+            attention_mask = inputs.get("attention_mask", None)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.whisper_device)
+            
+            # Generate transcription
+            with torch.no_grad():
+                if attention_mask is not None:
+                    predicted_ids = self.whisper_model.generate(
+                        input_features, 
+                        attention_mask=attention_mask
+                    )
+                else:
+                    predicted_ids = self.whisper_model.generate(input_features)
+            
+            # Decode transcription
+            transcription = self.whisper_processor.batch_decode(
+                predicted_ids, 
+                skip_special_tokens=True
+            )[0].strip()
+            
+            processing_time = time.time() - start_time
+            
+            # Update metrics
+            self.total_analyses += 1
+            self.total_processing_time += processing_time
+            
+            self.logger.info(
+                f"Whisper analysis #{self.total_analyses}: "
+                f"buffer={buffer_size} samples ({buffer_size/self.sample_rate:.2f}s), "
+                f"time={processing_time:.3f}s, "
+                f"result='{transcription[:50]}{'...' if len(transcription) > 50 else ''}'"
+            )
+            
+            return transcription, processing_time, buffer_size
+            
+        except Exception as e:
+            processing_time = time.time() - start_time
+            self.logger.error(f"Whisper analysis failed: {e}")
+            return "", processing_time, len(self.audio_buffer)
+    
+    def clear_buffer(self):
+        """Clear the audio buffer"""
+        self.audio_buffer.clear()
+        self.logger.debug("Audio buffer cleared")
+    
+    def get_buffer_info(self):
+        """Get current buffer information"""
+        buffer_size = len(self.audio_buffer)
+        duration_seconds = buffer_size / self.sample_rate if buffer_size > 0 else 0.0
+        
+        return {
+            "buffer_size": buffer_size,
+            "duration_seconds": duration_seconds,
+            "max_duration": self.buffer_duration,
+            "total_analyses": self.total_analyses,
+            "avg_processing_time": (
+                self.total_processing_time / self.total_analyses 
+                if self.total_analyses > 0 else 0.0
+            )
+        }
+
 class OnlineASRWithPunctuation(LoggerMixin):
     def __init__(self, asr_model_name, punct_model_name=None, lookahead_size=480, decoder_type="rnnt", 
                  quiet_mode=False, enable_eou=True, websocket_server=None, log_config=None):
@@ -1807,6 +1989,10 @@ class OnlineASRWithPunctuation(LoggerMixin):
         self.current_utterance = ""  # Accumulate text for complete utterance output
         self._setup_preprocessing()
         self._reset_streaming_state()
+        
+        # Initialize Whisper buffer (will be configured later based on config)
+        self.whisper_buffer = None
+        self.whisper_enabled = False
     
     def _setup_button_callbacks(self):
         """Setup callbacks for button controller"""
@@ -1903,20 +2089,53 @@ class OnlineASRWithPunctuation(LoggerMixin):
         if self.current_utterance.strip():
             final_text = self._apply_punctuation(self.current_utterance)
             
-            # Use the same complete EOU processing as automatic EOU
-            self._process_complete_utterance_output(final_text, quiet_mode=False, triggered=True)
+            # Handle Whisper analysis if enabled
+            whisper_utterance = None
+            if self.whisper_enabled and self.whisper_buffer:
+                try:
+                    whisper_result, processing_time, buffer_size = self.whisper_buffer.analyze_buffer()
+                    
+                    # Record key metrics as requested
+                    self.logger.info(f"Manual EOU Whisper Metrics: buffer_size={buffer_size} samples, processing_time={processing_time:.3f}s")
+                    
+                    if whisper_result.strip():
+                        whisper_utterance = whisper_result
+                        self.logger.info(f"Manual EOU Whisper result: '{whisper_utterance}'")
+                        
+                        if self.whisper_trust_over_streaming:
+                            final_text = whisper_utterance
+                    else:
+                        self.logger.warning(f"Manual EOU Whisper returned empty result from {buffer_size} samples")
+                except Exception as e:
+                    self.logger.error(f"Manual EOU Whisper analysis failed: {e}")
+            
+            # Process complete utterance with Whisper-aware logic
+            self._process_complete_utterance_output(final_text, whisper_utterance, quiet_mode=False, triggered=True)
+            
+            # Clear Whisper buffer if enabled
+            if self.whisper_enabled and self.whisper_buffer:
+                self.whisper_buffer.clear_buffer()
             
             # Reset state
             self._reset_streaming_state(reset_conversation=True, send_websocket_updates=False)
     
-    def _process_complete_utterance_output(self, complete_utterance, quiet_mode=False, triggered=False):
-        """Process and output a complete utterance with consistent formatting"""
+    def _process_complete_utterance_output(self, complete_utterance, whisper_utterance=None, quiet_mode=False, triggered=False):
+        """Process and output a complete utterance with Whisper-aware WebSocket logic"""
         if not complete_utterance.strip():
             return
         
-        # Send via WebSocket
+        # WebSocket logic: when Whisper is enabled, only send Whisper results
         if self.websocket_server:
-            self.websocket_server.send_complete_utterance(complete_utterance)
+            if self.whisper_enabled and self.whisper_buffer:
+                # Whisper mode: only send Whisper-processed text via WebSocket
+                if whisper_utterance and whisper_utterance.strip():
+                    self.websocket_server.send_complete_utterance(whisper_utterance)
+                    self.logger.debug("Sent Whisper-processed utterance via WebSocket (triggered)")
+                else:
+                    self.logger.debug("No valid Whisper result - skipping WebSocket complete utterance (triggered)")
+            else:
+                # Normal mode: send streaming text
+                self.websocket_server.send_complete_utterance(complete_utterance)
         
         # Log using the same format as automatic EOU
         if triggered:
@@ -1970,6 +2189,44 @@ class OnlineASRWithPunctuation(LoggerMixin):
             return eou_result.get("is_eou", False)
         
         return False
+    
+    def configure_whisper_buffer(self, config):
+        """Configure Whisper buffer based on configuration"""
+        if not WHISPER_AVAILABLE:
+            self.logger.warning("Whisper not available - buffer disabled")
+            self.whisper_enabled = False
+            return
+            
+        enable_whisper_raw = config.get("enable-whisper-buffer")
+        self.logger.debug(f"Raw Whisper config value: {enable_whisper_raw} (type: {type(enable_whisper_raw)})")
+        self.whisper_enabled = config.get("enable-whisper-buffer", False)
+        self.logger.debug(f"Whisper configuration check: enable-whisper-buffer={config.get('enable-whisper-buffer', 'not found')}")
+        
+        # More detailed config inspection
+        if "enable-whisper-buffer" in config:
+            self.logger.debug(f"Key 'enable-whisper-buffer' found with value: {config['enable-whisper-buffer']}")
+        else:
+            self.logger.debug("Key 'enable-whisper-buffer' NOT found in config")
+        
+        if self.whisper_enabled:
+            whisper_model = config.get("whisper-model", "openai/whisper-base")
+            buffer_duration = config.get("whisper-buffer-duration", 45)
+            self.whisper_trust_over_streaming = config.get("whisper-trust-over-streaming", False)
+            
+            self.logger.info(f"Initializing Whisper buffer: model={whisper_model}, duration={buffer_duration}s")
+            
+            try:
+                self.whisper_buffer = WhisperBuffer(
+                    whisper_model=whisper_model,
+                    buffer_duration=buffer_duration,
+                    log_config={"log_level": "info"}
+                )
+                self.logger.info("Whisper buffer initialized successfully")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize Whisper buffer: {e}")
+                self.whisper_enabled = False
+        else:
+            self.logger.info("Whisper buffer disabled by configuration")
     
     def _setup_asr_model(self):
         """Load and configure the ASR model"""
@@ -2301,6 +2558,10 @@ class OnlineASRWithPunctuation(LoggerMixin):
             # Convert int16 to float32 and normalize
             audio_data = audio_chunk.astype(np.float32) / 32768.0
             
+            # Feed audio to Whisper buffer if enabled
+            if self.whisper_enabled and self.whisper_buffer:
+                self.whisper_buffer.add_audio(audio_chunk)
+            
             # VAD-based EOU detection using raw audio (before preprocessing)
             is_frame_eou = self._check_end_of_utterance_frame_based(audio_data)
             
@@ -2416,15 +2677,50 @@ class OnlineASRWithPunctuation(LoggerMixin):
                     # Store the final complete utterance for output
                     complete_utterance = self.current_utterance.strip() if self.current_utterance.strip() else punctuated_text.strip()
                     
-                    # Send complete utterance via WebSocket
-                    if self.websocket_server and complete_utterance:
-                        self.websocket_server.send_complete_utterance(complete_utterance)
+                    # Handle Whisper buffer processing when enabled
+                    whisper_utterance = None
+                    if self.whisper_enabled and self.whisper_buffer:
+                        try:
+                            whisper_result, processing_time, buffer_size = self.whisper_buffer.analyze_buffer()
+                            
+                            # Record key metrics as requested
+                            self.logger.info(f"Whisper Analysis Metrics: buffer_size={buffer_size} samples, processing_time={processing_time:.3f}s")
+                            
+                            if whisper_result.strip():
+                                whisper_utterance = whisper_result
+                                self.logger.info(f"Whisper processed utterance: '{whisper_utterance}'")
+                                
+                                if self.whisper_trust_over_streaming:
+                                    # Replace streaming result with Whisper result
+                                    complete_utterance = whisper_utterance
+                            else:
+                                self.logger.warning(f"Whisper returned empty result from {buffer_size} samples after {processing_time:.3f}s processing")
+                        except Exception as e:
+                            self.logger.error(f"Whisper analysis failed (buffer_size={len(self.whisper_buffer.audio_buffer) if self.whisper_buffer else 0}): {e}")
+                    
+                    # WebSocket complete utterance logic based on Whisper mode
+                    if self.websocket_server:
+                        if self.whisper_enabled and self.whisper_buffer:
+                            # When Whisper is enabled: ONLY send Whisper-processed text via WebSocket
+                            if whisper_utterance and whisper_utterance.strip():
+                                self.websocket_server.send_complete_utterance(whisper_utterance)
+                                self.logger.debug("Sent Whisper-processed utterance via WebSocket")
+                            else:
+                                self.logger.debug("No valid Whisper result - skipping WebSocket complete utterance")
+                        else:
+                            # When Whisper is disabled: send streaming text as before
+                            if complete_utterance:
+                                self.websocket_server.send_complete_utterance(complete_utterance)
                     
                     # Always log complete utterances at CRITICAL level to ensure they're always shown
                     self.logger.critical(f"COMPLETE UTTERANCE: {complete_utterance}")
                     
                     eou_type = "VAD" if is_frame_eou else "Text"
                     self.logger.debug(f"{eou_type}-EOU: End of utterance confirmed with recent speech or accumulated text, performing internal ASR reset")
+                    
+                    # Clear Whisper buffer if enabled
+                    if self.whisper_enabled and self.whisper_buffer:
+                        self.whisper_buffer.clear_buffer()
                     
                     # INTERNAL ASR RESET - Reset conversation buffer and streaming state silently
                     # This is just internal cleanup, no status messages needed for clients
@@ -3434,6 +3730,9 @@ def main():
             main_logger.debug(f"  Overall threshold: {eou_threshold}")
         else:
             main_logger.info("EOU detection disabled")
+            
+        # Configure Whisper buffer if enabled
+        asr_system.configure_whisper_buffer(config)
     
         main_logger.info("ASR system ready!")
         main_logger.info(f"ASR Model: {asr_model}")
