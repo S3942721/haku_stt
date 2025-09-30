@@ -121,6 +121,21 @@ def verbose(self, message, *args, **kwargs):
 
 logging.Logger.verbose = verbose
 
+def sanitize_to_ascii(text, replacement='?'):
+    """
+    Return text containing only ASCII characters.
+    Non-ASCII characters are replaced with `replacement` (default '?').
+    Keeps None/empty safe.
+    """
+    if text is None:
+        return text
+    try:
+        # Replace non-ascii with '?'
+        return text.encode('ascii', 'replace').decode('ascii')
+    except Exception:
+        # Fallback: iterate
+        return ''.join((c if ord(c) < 128 else replacement) for c in text)
+
 class LoggerMixin:
     """Mixin to provide consistent logging to classes"""
     
@@ -1606,7 +1621,7 @@ class WebSocketServer(LoggerMixin):
             
         message = {
             "type": "partial",
-            "text": text,
+            "text": sanitize_to_ascii(text),
             "timestamp": time.time(),
             "confidence": confidence
         }
@@ -1626,7 +1641,7 @@ class WebSocketServer(LoggerMixin):
             
         message = {
             "type": "complete",
-            "text": text,
+            "text": sanitize_to_ascii(text),
             "timestamp": time.time(),
             "confidence": confidence
         }
