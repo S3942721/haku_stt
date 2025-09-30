@@ -1,5 +1,5 @@
 {
-  "mode-selection": "fast-eou",
+  "mode-selection": "fast-eou-buffer-accurate-medium",
   "descriptions": {
     "asr-model": "ASR model name to use",
     "punct-model": "Punctuation model name (None to disable punctuation)",
@@ -33,7 +33,11 @@
     "log-format": "Log message format string",
     "log-file": "Optional log file path (None for console only)",
     "log-max-size": "Maximum log file size in MB before rotation",
-    "log-backup-count": "Number of backup log files to keep"
+    "log-backup-count": "Number of backup log files to keep",
+    "enable-whisper-buffer": "Enable full utterance analysis with Whisper model after streaming EOU detection",
+    "whisper-model": "Whisper model name for full utterance analysis (e.g., 'distil-whisper/distil-small.en')",
+    "whisper-buffer-duration": "Duration in seconds of audio buffer for Whisper analysis (default: 45)",
+    "whisper-trust-over-streaming": "If true, only output utterances if Whisper confirms text exists"
   },
   "vad-defaults": {
     "nvidia": {
@@ -82,7 +86,11 @@
       "log-format": "[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s",
       "log-file": null,
       "log-max-size": 10,
-      "log-backup-count": 3
+      "log-backup-count": 3,
+      "enable-whisper-buffer": false,
+      "whisper-model": "distil-whisper/distil-small.en",
+      "whisper-buffer-duration": 45,
+      "whisper-trust-over-streaming": false
     },
     "fast": {
       "asr-model": "stt_en_fastconformer_hybrid_large_streaming_80ms",
@@ -119,6 +127,69 @@
       "eou-threshold": 0.7,
       "eou-min-words": 2,
       "eou-confirmation-needed": 1
+    },
+    "fast-eou-buffer": {
+      "vad-model": "silero",
+      "enable-text-eou": true,
+      "vad-speech-proportion-threshold": 0.1,
+      "vad-analysis-window": 2.0,
+      "vad-consecutive-silence-threshold": 0.6,
+      "vad-min-frames-for-eou": 0.3,
+      "vad-recent-speech-lookback-seconds": 5.0,
+      "vad-recent-speech-threshold": 0.1,
+      "eou-threshold": 0.7,
+      "eou-min-words": 2,
+      "eou-confirmation-needed": 1,
+      "enable-whisper-buffer": true,
+      "whisper-model": "distil-whisper/distil-small.en",
+      "whisper-buffer-duration": 45,
+      "whisper-trust-over-streaming": true,
+      "log-level": "debug"
+    },
+    "fast-eou-buffer-accurate-medium": {
+      "vad-model": "silero",
+      "enable-text-eou": true,
+      "vad-speech-proportion-threshold": 0.1,
+      "vad-analysis-window": 2.0,
+      "vad-consecutive-silence-threshold": 0.6,
+      "vad-min-frames-for-eou": 0.3,
+      "vad-recent-speech-lookback-seconds": 5.0,
+      "vad-recent-speech-threshold": 0.1,
+      "eou-threshold": 0.7,
+      "eou-min-words": 2,
+      "eou-confirmation-needed": 1,
+      "enable-whisper-buffer": true,
+      "whisper-model": "distil-whisper/distil-large-v3",
+      "whisper-buffer-duration": 45,
+      "whisper-trust-over-streaming": true,
+      "log-level": "debug"
+    },
+    "fast-eou-buffer-accurate-slow": {
+      "vad-model": "silero",
+      "enable-text-eou": true,
+      "vad-speech-proportion-threshold": 0.1,
+      "vad-analysis-window": 2.0,
+      "vad-consecutive-silence-threshold": 0.6,
+      "vad-min-frames-for-eou": 0.3,
+      "vad-recent-speech-lookback-seconds": 5.0,
+      "vad-recent-speech-threshold": 0.1,
+      "eou-threshold": 0.7,
+      "eou-min-words": 2,
+      "eou-confirmation-needed": 1,
+      "enable-whisper-buffer": true,
+      "whisper-model": "openai/whisper-large-v3",
+      "whisper-buffer-duration": 45,
+      "whisper-trust-over-streaming": true,
+      "log-level": "debug"
+    },
+    "streaming-eou-buffer-asr": {
+      "enable-whisper-buffer": true,
+      "whisper-model": "distil-whisper/distil-small.en",
+      "whisper-buffer-duration": 45,
+      "whisper-trust-over-streaming": true,
+      "vad-model": "silero",
+      "enable-text-eou": true,
+      "log-level": "info"
     }
   }
 }
