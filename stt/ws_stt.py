@@ -1783,6 +1783,10 @@ class WhisperBuffer(LoggerMixin):
         # Audio buffer as deque for efficient operations
         self.audio_buffer = deque(maxlen=self.max_buffer_samples)
         
+        # Speech-aware buffering state
+        self.is_recording = False  # Only record when speech is detected
+        self.speech_started = False  # Track if we've seen speech in current utterance
+        
         # Whisper model components
         self.whisper_processor = None
         self.whisper_model = None
@@ -1826,16 +1830,55 @@ class WhisperBuffer(LoggerMixin):
             self.whisper_processor = None
             self.whisper_model = None
     
-    def add_audio(self, audio_chunk):
-        """Add audio chunk to buffer"""
+    def add_audio(self, audio_chunk, has_speech=True):
+        """
+        Add audio chunk to buffer only when speech is active
+        
+        Args:
+            audio_chunk: Audio data to add
+            has_speech: Whether current audio contains speech (from VAD)
+        """
         if isinstance(audio_chunk, np.ndarray):
             # Convert to float32 if needed
             if audio_chunk.dtype == np.int16:
                 audio_chunk = audio_chunk.astype(np.float32) / 32768.0
             
-            # Add samples to buffer
-            for sample in audio_chunk:
-                self.audio_buffer.append(sample)
+            # Start recording when speech is detected
+            if has_speech and not self.is_recording:
+                self.is_recording = True
+                self.speech_started = True
+                self.logger.debug("Whisper buffer: Started recording (speech detected)")
+            
+            # Only add audio when recording is active (speech present)
+            if self.is_recording:
+                # Add samples to buffer
+                for sample in audio_chunk:
+                    self.audio_buffer.append(sample)
+    
+    def stop_recording(self):
+        """Stop recording audio to buffer (called when EOU detected)"""
+        if self.is_recording:
+            buffer_duration = len(self.audio_buffer) / self.sample_rate
+            self.logger.debug(f"Whisper buffer: Stopped recording (buffer size: {len(self.audio_buffer)} samples, {buffer_duration:.2f}s)")
+            self.is_recording = False
+    
+    def should_clear_on_silence(self, consecutive_silence_frames, silence_threshold):
+        """
+        Check if buffer should be cleared due to prolonged silence without speech
+        
+        Args:
+            consecutive_silence_frames: Current consecutive silence frame count
+            silence_threshold: Threshold for triggering silence clear
+            
+        Returns:
+            bool: True if buffer should be cleared
+        """
+        # If we haven't started recording yet, and we hit silence threshold, clear any accumulated audio
+        if not self.speech_started and consecutive_silence_frames >= silence_threshold:
+            if len(self.audio_buffer) > 0:
+                self.logger.debug(f"Whisper buffer: Clearing {len(self.audio_buffer)} samples due to silence without speech")
+                return True
+        return False
     
     def analyze_buffer(self):
         """
@@ -1911,9 +1954,11 @@ class WhisperBuffer(LoggerMixin):
             return "", processing_time, len(self.audio_buffer)
     
     def clear_buffer(self):
-        """Clear the audio buffer"""
+        """Clear the audio buffer and reset recording state"""
         self.audio_buffer.clear()
-        self.logger.debug("Audio buffer cleared")
+        self.is_recording = False
+        self.speech_started = False
+        self.logger.debug("Audio buffer cleared and recording state reset")
     
     def get_buffer_info(self):
         """Get current buffer information"""
@@ -2573,12 +2618,22 @@ class OnlineASRWithPunctuation(LoggerMixin):
             # Convert int16 to float32 and normalize
             audio_data = audio_chunk.astype(np.float32) / 32768.0
             
-            # Feed audio to Whisper buffer if enabled
-            if self.whisper_enabled and self.whisper_buffer:
-                self.whisper_buffer.add_audio(audio_chunk)
-            
             # VAD-based EOU detection using raw audio (before preprocessing)
             is_frame_eou = self._check_end_of_utterance_frame_based(audio_data)
+            
+            # Check if there's recent speech activity for Whisper buffer management
+            has_recent_speech = self.frame_detector.has_recent_speech_activity(lookback_seconds=0.5)  # Short lookback for immediate speech detection
+            
+            # Feed audio to Whisper buffer if enabled (only when speech is present)
+            if self.whisper_enabled and self.whisper_buffer:
+                self.whisper_buffer.add_audio(audio_chunk, has_speech=has_recent_speech)
+                
+                # Check if we should clear buffer due to prolonged silence without speech
+                if self.whisper_buffer.should_clear_on_silence(
+                    self.frame_detector.consecutive_silence_frames,
+                    self.frame_detector.consecutive_silence_threshold
+                ):
+                    self.whisper_buffer.clear_buffer()
             
             # Get mel-spectrogram
             processed_signal, processed_signal_length = self._preprocess_audio(audio_data)
@@ -2684,6 +2739,10 @@ class OnlineASRWithPunctuation(LoggerMixin):
             # Handle EOU detection and complete utterance output
             complete_utterance = None
             if is_eou:
+                # Stop recording in Whisper buffer before analysis
+                if self.whisper_enabled and self.whisper_buffer:
+                    self.whisper_buffer.stop_recording()
+                
                 # Check if there was recent speech activity or accumulated utterance text
                 has_recent_speech = self.frame_detector.has_recent_speech_activity(lookback_seconds=2.0)
                 has_accumulated_text = bool(self.current_utterance.strip())
