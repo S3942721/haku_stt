@@ -1,10 +1,2 @@
   python vad_eou_streaming_with_punctuation_quiet.py --asr-model stt_en_fastconformer_hybrid_large_streaming_multi --punct-model punctuation_en_bert --device 9 --quiet
   python asr_llm_integration.py --llm-endpoint wss://pn29n22pi7.execute-api.ap-southeast-2.amazonaws.com/production/ --verbose --device 9
-
-  Prompt:
-
-  I want to refactor my ASR LLM integration to instead of accessing a local microphone device it receives audio from the remote device via the GStream RTP audio stream. I have attached both an example receiver that plays the live audio through the speakers, as well as the exact module on the remote device that is streaming the audio to the ASR LLM file.
-
-I want the audio data to be a complete replacement of the hardware audio recognition and when no device is selected, or if the remote audio stream is selected it should instead of using the local audio device opt to use the audio stream from the remote. When in verbose mode there should be debugging information like volume and other details to ensure the audio stream is working correctly.
-
-Thanks!
